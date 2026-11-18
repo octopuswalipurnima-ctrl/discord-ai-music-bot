@@ -99,7 +99,17 @@ const dashboard = new SlashCommandBuilder()
   .setName('dashboard')
   .setDescription('Get a private, direct link to the web music dashboard with your server role');
 
+const join = new SlashCommandBuilder()
+  .setName('join')
+  .setDescription('Summon the bot to your current voice channel and open the music controller');
+
+const controls = new SlashCommandBuilder()
+  .setName('controls')
+  .setDescription('Open the interactive music controller panel');
+
 export const commands = [
+  join,
+  controls,
   dashboard,
   new SlashCommandBuilder().setName('play').setDescription('Play an approved stream URL or a track from this server catalogue')
     .addStringOption((o) => o.setName('url').setDescription('Direct HTTPS audio URL').setRequired(false).setMaxLength(1500))

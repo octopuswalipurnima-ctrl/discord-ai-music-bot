@@ -19,6 +19,7 @@ export interface Track {
   language?: string;
   bpm?: number;
   energy?: number;
+  durationSeconds?: number;
 }
 
 function parseApprovedUrl(urlText: string): URL {

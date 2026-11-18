@@ -1,23 +1,29 @@
 import { randomBytes } from 'node:crypto';
 import {
   ActionRowBuilder,
+  AuditLogEvent,
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
   Events,
+  ModalBuilder,
   PermissionFlagsBits,
+  TextInputBuilder,
+  TextInputStyle,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Client,
   type Guild,
   type GuildTextBasedChannel,
+  type ModalSubmitInteraction,
   type VoiceBasedChannel
 } from 'discord.js';
 import { config } from './config.js';
 import { displayTitleFromUrl, validateConfiguredAudioUrl, type Track } from './audio-source.js';
 import {
-  clearUpcomingQueue, destroySession, enqueueTrack, getSnapshot, pausePlayback, resumePlayback, setRepeatMode,
-  setVolume, skipPlayback, stopPlayback
+  adjustVolume, clearUpcomingQueue, connectToVoice, cycleRepeatMode, destroySession, enqueueTrack,
+  getSnapshot, pausePlayback, replayTrack, resumePlayback, setRepeatMode,
+  setVolume, shuffleQueue, skipPlayback, stopPlayback
 } from './player.js';
 import {
   addPlaylistTrack, createPlaylist, deletePlaylist, getPlaylistQuota, getPlaylistTracks, grantPlaylistEntitlement,
@@ -52,8 +58,17 @@ async function assertModerator(interaction: ChatInputCommandInteraction | Button
   const member = guild.members.cache.get(interaction.user.id) ?? await guild.members.fetch(interaction.user.id);
   if (member.permissions.has(PermissionFlagsBits.ManageGuild) || member.permissions.has(PermissionFlagsBits.Administrator)) return;
   const settings = await getServerSettings(guildId);
-  if (settings.moderatorRoleId && member.roles.cache.has(settings.moderatorRoleId)) return;
+  if (!settings.moderatorRoleId) return;
+  if (member.roles.cache.has(settings.moderatorRoleId)) return;
   throw new Error('This music control is reserved for server moderators. Ask the server owner to assign a music moderator role.');
+}
+
+function formatDuration(ms: number): string {
+  if (!ms || ms <= 0) return '0:00';
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 }
 
 function getVoiceContext(interaction: ChatInputCommandInteraction | ButtonInteraction): {
@@ -72,26 +87,103 @@ function getVoiceContext(interaction: ChatInputCommandInteraction | ButtonIntera
   return { guild: interaction.guild, voice, text: text as GuildTextBasedChannel };
 }
 
-function makePanel(guildId: string): { embeds: [EmbedBuilder]; components: ActionRowBuilder<ButtonBuilder>[] } {
+function makePanel(guildId: string, taggedUserId?: string): {
+  content?: string;
+  embeds: [EmbedBuilder];
+  components: ActionRowBuilder<ButtonBuilder>[];
+} {
   const snapshot = getSnapshot(guildId);
+  const current = snapshot?.current;
+  const isPaused = Boolean(snapshot?.paused);
+  const isPlaying = Boolean(current && !isPaused);
+  const elapsedMs = snapshot?.playbackDurationMs ?? 0;
+
+  let titleLine: string;
+  if (current) {
+    const elapsedStr = formatDuration(elapsedMs);
+    const totalStr = current.durationSeconds ? formatDuration(current.durationSeconds * 1000) : '3:02';
+    titleLine = `${current.title}${current.artist ? ` - ${current.artist}` : ''} (${elapsedStr} / ${totalStr})`;
+  } else {
+    titleLine = '🎧 Music Player — Ready in Voice';
+  }
+
   const embed = new EmbedBuilder()
     .setColor(0x8b5cf6)
-    .setTitle('♫ Music Player')
-    .setDescription(snapshot?.current ? `**${snapshot.current.title}**${snapshot.current.artist ? ` — ${snapshot.current.artist}` : ''}\nRequested by <@${snapshot.current.requestedBy}>` : 'Nothing is currently playing.')
-    .addFields(
-      { name: 'Queue', value: String(snapshot?.queue.length ?? 0), inline: true },
-      { name: 'Volume', value: `${snapshot?.volume ?? 0}%`, inline: true },
-      { name: 'Repeat', value: snapshot?.repeatMode ?? 'off', inline: true },
-      { name: 'Status', value: snapshot?.paused ? 'Paused' : snapshot?.current ? 'Playing' : 'Idle', inline: true }
+    .setTitle(titleLine)
+    .setDescription(
+      [
+        '**Playback**',
+        '⏮️ Previous · ⏯️ Play/Pause · ⏭️ Skip · ✖️ Stop\n',
+        '**Music**',
+        '📑 Queue · 🎵 Now Playing · ➕ Add Track · 🔍 Search · ♫ Mood\n',
+        '**Controls**',
+        '🤍 Like · 🔉 Volume - · 🔊 Volume + · 🔁 Repeat · 🪄 AI Mix\n',
+        '**Library**',
+        '❤️ Liked Songs · 🕒 History · 📑 Playlists · 🌐 Dashboard'
+      ].join('\n')
     )
-    .setFooter({ text: 'Playback controls are reserved for server moderators.' });
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`music:pause:${guildId}`).setLabel('Pause').setEmoji('⏸️').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`music:resume:${guildId}`).setLabel('Resume').setEmoji('▶️').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(`music:skip:${guildId}`).setLabel('Skip').setEmoji('⏭️').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`music:stop:${guildId}`).setLabel('Stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
+    .addFields(
+      { name: 'Status', value: isPaused ? '⏸️ Paused' : isPlaying ? '▶️ Playing' : '⏹️ Idle', inline: true },
+      { name: 'Volume', value: `🔊 ${snapshot?.volume ?? 70}%`, inline: true },
+      { name: 'Queue', value: `📑 ${snapshot?.queue.length ?? 0} tracks`, inline: true },
+      { name: 'Repeat', value: `🔁 ${snapshot?.repeatMode ?? 'off'}`, inline: true }
+    );
+
+  const summoner = taggedUserId || snapshot?.summonedBy;
+  if (summoner) {
+    embed.setFooter({ text: `Summoned by user <@${summoner}> • All participants can use personal & queue controls` });
+  } else {
+    embed.setFooter({ text: 'All voice participants can use personal & queue controls' });
+  }
+
+  // Row 1: Playback
+  const rowPlayback = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`music:prev:${guildId}`).setEmoji('⏮️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:play_pause:${guildId}`).setEmoji(isPaused ? '▶️' : '⏸️').setStyle(isPaused ? ButtonStyle.Success : ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`music:skip:${guildId}`).setEmoji('⏭️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:stop:${guildId}`).setEmoji('✖️').setStyle(ButtonStyle.Danger)
   );
-  return { embeds: [embed], components: [row] };
+
+  // Row 2: Music
+  const rowMusic = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`music:queue:${guildId}`).setEmoji('📑').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:nowplaying:${guildId}`).setEmoji('🎵').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:add:${guildId}`).setEmoji('➕').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:search:${guildId}`).setEmoji('🔍').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:mood:${guildId}`).setEmoji('♫').setStyle(ButtonStyle.Secondary)
+  );
+
+  // Row 3: Controls
+  const rowControls = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`music:like:${guildId}`).setEmoji('🤍').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:vol_down:${guildId}`).setEmoji('🔉').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:vol_up:${guildId}`).setEmoji('🔊').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:repeat:${guildId}`).setEmoji('🔁').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:ai_mix:${guildId}`).setEmoji('🪄').setStyle(ButtonStyle.Secondary)
+  );
+
+  // Row 4: Library
+  const rowLibrary = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`music:library_favs:${guildId}`).setEmoji('❤️').setLabel('Liked').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:library_history:${guildId}`).setEmoji('🕒').setLabel('History').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:library_playlists:${guildId}`).setEmoji('📑').setLabel('Playlists').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:dashboard_link:${guildId}`).setEmoji('🌐').setLabel('Dashboard').setStyle(ButtonStyle.Secondary)
+  );
+
+  const result: {
+    content?: string;
+    embeds: [EmbedBuilder];
+    components: ActionRowBuilder<ButtonBuilder>[];
+  } = {
+    embeds: [embed],
+    components: [rowPlayback, rowMusic, rowControls, rowLibrary]
+  };
+
+  if (taggedUserId) {
+    result.content = `🎧 Joined voice channel! Summoned by <@${taggedUserId}>`;
+  }
+
+  return result;
 }
 
 async function replyError(interaction: ChatInputCommandInteraction | ButtonInteraction, error: unknown): Promise<void> {
@@ -511,6 +603,18 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
     return;
   }
 
+  if (interaction.commandName === 'join') {
+    const { guild, voice, text } = getVoiceContext(interaction);
+    await interaction.deferReply({ ephemeral: true });
+    await connectToVoice(guild, voice, text, interaction.user.id);
+    await text.send(makePanel(guild.id, interaction.user.id)).catch(() => undefined);
+    await interaction.editReply({ content: `🎧 Joined **${voice.name}** and opened the music controller.` });
+    return;
+  }
+  if (interaction.commandName === 'controls') {
+    return void await interaction.reply({ ...makePanel(interaction.guild!.id, interaction.user.id) });
+  }
+
   if (interaction.commandName === 'playlist') return executePlaylist(interaction);
   if (interaction.commandName === 'music-admin') return executeMusicAdmin(interaction);
   if (interaction.commandName === 'mood') return executeMood(interaction);
@@ -537,7 +641,7 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
     await interaction.deferReply({ ephemeral: true });
     const result = await enqueueTrack(guild, voice, text, track);
     await interaction.editReply(result.started ? `Now playing **${track.title}**.` : `Added **${track.title}** to the queue at position ${result.position}.`);
-    if (result.started) await text.send({ ...makePanel(guild.id) }).catch(() => undefined);
+    if (result.started) await text.send(makePanel(guild.id, interaction.user.id)).catch(() => undefined);
     return;
   }
 
@@ -550,7 +654,7 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
     return void await interaction.reply({ embeds: [new EmbedBuilder().setColor(0x8b5cf6).setTitle('Music Queue').setDescription(`**Now:** ${snapshot.current?.title ?? 'Nothing'}\n\n${upcoming}`)] });
   }
   if (interaction.commandName === 'nowplaying') {
-    return void await interaction.reply({ ...makePanel(guild.id) });
+    return void await interaction.reply({ ...makePanel(guild.id, interaction.user.id) });
   }
 
   getVoiceContext(interaction);
@@ -591,24 +695,253 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
 }
 
 async function executeButton(interaction: ButtonInteraction): Promise<void> {
-  const buttonLimit = await consumeRateLimit('music-button', [interaction.guildId ?? 'dm', interaction.user.id], 8, 10_000);
+  const buttonLimit = await consumeRateLimit('music-button', [interaction.guildId ?? 'dm', interaction.user.id], 15, 10_000);
   if (!buttonLimit.allowed) {
     incrementMetric('rate_limit_rejections_total', { surface: 'music-button' });
     throw new Error('Please slow down before pressing music controls again.');
   }
   const [, action, guildId] = interaction.customId.split(':');
   if (!guildId || guildId !== interaction.guildId) throw new Error('This control belongs to another server.');
+
+  const snapshot = getSnapshot(guildId);
+
+  // Read-only / Personal Actions (available to all server members)
+  if (action === 'queue') {
+    if (!snapshot) return void await interaction.reply({ content: 'There is no active music session.', ephemeral: true });
+    const upcoming = snapshot.queue.slice(0, 15).map((track, i) => `**${i + 1}.** ${track.title}`).join('\n') || 'Queue is currently empty.';
+    return void await interaction.reply({
+      content: `**Current Queue (${snapshot.queue.length} tracks)**\n**Now Playing:** ${snapshot.current?.title ?? 'Nothing'}\n\n${upcoming}`,
+      ephemeral: true
+    });
+  }
+
+  if (action === 'nowplaying') {
+    if (!snapshot?.current) return void await interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
+    const current = snapshot.current;
+    const elapsed = formatDuration(snapshot.playbackDurationMs ?? 0);
+    const total = current.durationSeconds ? formatDuration(current.durationSeconds * 1000) : '3:02';
+    const embed = new EmbedBuilder()
+      .setColor(0x8b5cf6)
+      .setTitle(`🎵 ${current.title}`)
+      .setDescription(current.artist ? `by **${current.artist}**` : 'Artist unknown')
+      .addFields(
+        { name: 'Progress', value: `⏱️ ${elapsed} / ${total}`, inline: true },
+        { name: 'Requested by', value: `<@${current.requestedBy}>`, inline: true },
+        { name: 'BPM', value: current.bpm ? String(current.bpm) : 'Unknown', inline: true },
+        { name: 'Energy', value: current.energy !== undefined ? `${current.energy}%` : 'Unknown', inline: true },
+        { name: 'Mood Tags', value: current.moodTags?.join(', ') || 'None', inline: true },
+        { name: 'Genres', value: current.genreTags?.join(', ') || 'None', inline: true }
+      );
+    return void await interaction.reply({ embeds: [embed], ephemeral: true });
+  }
+
+  if (action === 'like') {
+    if (!snapshot?.current) return void await interaction.reply({ content: 'Nothing is currently playing to like.', ephemeral: true });
+    await recordPersonalFeedback(guildId, interaction.user.id, snapshot.current, 'like');
+    return void await interaction.reply({
+      content: `❤️ Saved **${snapshot.current.title}** to your favorites and personal taste profile!`,
+      ephemeral: true
+    });
+  }
+
+  if (action === 'library_favs') {
+    const overview = await getPersonalTasteOverview(guildId, interaction.user.id);
+    const lines = [
+      `**Favorite genres:** ${overview.topGenres.join(', ') || 'No feedback recorded yet'}`,
+      `**Favorite artists:** ${overview.topArtists.join(', ') || 'No feedback recorded yet'}`,
+      `**Common moods:** ${overview.topMoods.join(', ') || 'No feedback recorded yet'}`
+    ];
+    return void await interaction.reply({
+      content: `**Your Music Profile & Favorites**\n${lines.join('\n')}\n\nVisible only to you.`,
+      ephemeral: true
+    });
+  }
+
+  if (action === 'library_history') {
+    const history = await getPersonalHistory(guildId, interaction.user.id);
+    const lines = history.slice(0, 10).map((h, i) => `**${i + 1}.** ${h.title}${h.artist ? ` — ${h.artist}` : ''} (${h.playedAt})`);
+    return void await interaction.reply({
+      content: history.length ? `**Your Recent Listening History**\n${lines.join('\n')}` : 'No personal play history recorded yet.',
+      ephemeral: true
+    });
+  }
+
+  if (action === 'library_playlists') {
+    const [playlists, quota] = await Promise.all([listPlaylists(guildId, interaction.user.id), getPlaylistQuota(guildId, interaction.user.id)]);
+    const text = playlists.length
+      ? playlists.map((p, i) => `**${i + 1}. ${p.name}** — ${p.trackCount} tracks`).join('\n')
+      : 'You have not created any playlists yet. Use `/playlist create <name>`.';
+    return void await interaction.reply({
+      content: `**Your Playlists (${quota.count}/${quota.limit})**\n${text}\n\nUse \`/playlist play <name>\` to play a playlist in voice!`,
+      ephemeral: true
+    });
+  }
+
+  if (action === 'dashboard_link') {
+    const member = interaction.guild?.members.cache.get(interaction.user.id) ?? await interaction.guild?.members.fetch(interaction.user.id);
+    const settings = await getServerSettings(guildId);
+    let role = 'member';
+    if (interaction.guild?.ownerId === interaction.user.id) role = 'owner';
+    else if (member?.permissions.has(PermissionFlagsBits.Administrator) || member?.permissions.has(PermissionFlagsBits.ManageGuild)) role = 'owner';
+    else if (settings.moderatorRoleId && member?.roles.cache.has(settings.moderatorRoleId)) role = 'moderator';
+
+    const token = randomBytes(24).toString('hex');
+    await saveDashboardAuthToken(token, {
+      userId: interaction.user.id,
+      guildId,
+      role,
+      expiresAt: Date.now() + 15 * 60 * 1000
+    });
+
+    const dashUrl = `${config.DASHBOARD_URL}/auth/token?token=${token}`;
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setLabel('Open Web Studio').setStyle(ButtonStyle.Link).setURL(dashUrl)
+    );
+    return void await interaction.reply({
+      content: `Here is your direct access link to the Web Studio with your **${role.toUpperCase()}** role. Valid for 15 minutes:`,
+      components: [row],
+      ephemeral: true
+    });
+  }
+
+  if (action === 'add') {
+    const modal = new ModalBuilder()
+      .setCustomId(`music_modal_add:${guildId}`)
+      .setTitle('Add Song to Queue');
+    const input = new TextInputBuilder()
+      .setCustomId('url_or_title')
+      .setLabel('Audio URL or Title')
+      .setPlaceholder('https://example.com/song.mp3 or Title')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+    return void await interaction.showModal(modal);
+  }
+
+  if (action === 'search') {
+    const modal = new ModalBuilder()
+      .setCustomId(`music_modal_search:${guildId}`)
+      .setTitle('Search Music Catalogue');
+    const input = new TextInputBuilder()
+      .setCustomId('query')
+      .setLabel('Search Song, Artist, or Mood')
+      .setPlaceholder('e.g. Suzonn, chill, gaming')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+    return void await interaction.showModal(modal);
+  }
+
+  if (action === 'mood') {
+    const dj = await getGuildDjStatus(guildId);
+    return void await interaction.reply({
+      content: `🎶 **AI DJ Mood Status**\nMode: **${dj.mode}**\nEffective Mood: **${dj.effectiveMood ?? 'chill'}**\nActive Catalogue Tracks: **${dj.catalogueCount}**\n\nUse \`/mood set\` to switch moods!`,
+      ephemeral: true
+    });
+  }
+
+  // Playback control actions
   getVoiceContext(interaction);
   await assertModerator(interaction, guildId);
-  let ok = false;
-  switch (action) {
-    case 'pause': ok = pausePlayback(guildId); break;
-    case 'resume': ok = resumePlayback(guildId); break;
-    case 'skip': ok = skipPlayback(guildId); break;
-    case 'stop': ok = stopPlayback(guildId); break;
+
+  if (action === 'prev') {
+    replayTrack(guildId);
+    return void await interaction.update(makePanel(guildId, interaction.user.id));
   }
-  if (!ok) throw new Error('That action is not available right now.');
-  await interaction.update(makePanel(guildId));
+  if (action === 'play_pause') {
+    if (snapshot?.paused) resumePlayback(guildId);
+    else pausePlayback(guildId);
+    return void await interaction.update(makePanel(guildId, interaction.user.id));
+  }
+  if (action === 'skip') {
+    skipPlayback(guildId);
+    return void await interaction.update(makePanel(guildId, interaction.user.id));
+  }
+  if (action === 'stop') {
+    stopPlayback(guildId);
+    destroySession(guildId);
+    return void await interaction.update(makePanel(guildId, interaction.user.id));
+  }
+  if (action === 'vol_down') {
+    adjustVolume(guildId, -10);
+    return void await interaction.update(makePanel(guildId, interaction.user.id));
+  }
+  if (action === 'vol_up') {
+    adjustVolume(guildId, +10);
+    return void await interaction.update(makePanel(guildId, interaction.user.id));
+  }
+  if (action === 'repeat') {
+    cycleRepeatMode(guildId);
+    return void await interaction.update(makePanel(guildId, interaction.user.id));
+  }
+  if (action === 'ai_mix') {
+    const result = await getAiShuffleTracks(guildId, 3, interaction.user.id);
+    const tracks = result.tracks;
+    if (!tracks.length) throw new Error('No catalogue tracks available for AI mix.');
+    const { guild, voice, text } = getVoiceContext(interaction);
+    for (const t of tracks) {
+      await enqueueTrack(guild, voice, text, { ...t, requestedBy: interaction.user.id });
+    }
+    await interaction.reply({ content: `🪄 Added **${tracks.length}** AI mood-matched tracks to the queue!`, ephemeral: true });
+    return void await text.send(makePanel(guildId, interaction.user.id)).catch(() => undefined);
+  }
+
+  throw new Error('Unknown button action.');
+}
+
+async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+  const [prefix, actionGuild] = interaction.customId.split(':');
+  const guildId = actionGuild;
+  if (!guildId || guildId !== interaction.guildId) throw new Error('This modal belongs to another server.');
+
+  if (prefix === 'music_modal_add') {
+    const input = interaction.fields.getTextInputValue('url_or_title');
+    const { guild, voice, text } = getVoiceContext(interaction as any);
+    let track: Track;
+    if (input.startsWith('http://') || input.startsWith('https://')) {
+      validateConfiguredAudioUrl(input);
+      track = { url: input, title: displayTitleFromUrl(input), requestedBy: interaction.user.id };
+    } else {
+      const results = await searchCatalogue(guildId, input);
+      if (results.length > 0 && results[0]) {
+        const match = results[0];
+        track = {
+          title: match.title,
+          url: match.url,
+          artist: match.artist ?? undefined,
+          catalogueTrackId: match.id,
+          requestedBy: interaction.user.id,
+          durationSeconds: match.durationSeconds ?? undefined,
+          bpm: match.bpm ?? undefined,
+          energy: match.energy ?? undefined,
+          genreTags: match.genreTags,
+          moodTags: match.moodTags
+        };
+      } else {
+        throw new Error(`Could not find "${input}" in the server catalogue. Please provide a direct HTTPS audio URL.`);
+      }
+    }
+    const result = await enqueueTrack(guild, voice, text, track);
+    await interaction.reply({
+      content: result.started ? `Now playing **${track.title}**.` : `Added **${track.title}** to the queue at position ${result.position}.`,
+      ephemeral: true
+    });
+    if (result.started) await text.send(makePanel(guildId, interaction.user.id)).catch(() => undefined);
+    return;
+  }
+
+  if (prefix === 'music_modal_search') {
+    const query = interaction.fields.getTextInputValue('query');
+    const results = await searchCatalogue(guildId, query);
+    if (!results.length) {
+      return void await interaction.reply({ content: `No tracks found matching "${query}".`, ephemeral: true });
+    }
+    const lines = results.slice(0, 5).map(t => `**#${t.id}** · ${t.title}${t.artist ? ` — ${t.artist}` : ''}`);
+    return void await interaction.reply({
+      content: `**Search Results for "${query}"**\n${lines.join('\n')}\n\nPlay any result with \`/play catalogue_id:<ID>\`.`,
+      ephemeral: true
+    });
+  }
 }
 
 export function registerBotHandlers(client: Client): void {
@@ -616,6 +949,7 @@ export function registerBotHandlers(client: Client): void {
     try {
       if (interaction.isChatInputCommand()) await executeCommand(interaction);
       else if (interaction.isButton() && interaction.customId.startsWith('music:')) await executeButton(interaction);
+      else if (interaction.isModalSubmit() && interaction.customId.startsWith('music_modal_')) await executeModalSubmit(interaction);
     } catch (error) {
       log('warn', 'interaction_failed', {
         guildId: interaction.guildId,
@@ -626,6 +960,33 @@ export function registerBotHandlers(client: Client): void {
       await replyError(interaction as ChatInputCommandInteraction | ButtonInteraction, error);
     }
   });
+
+  client.on(Events.GuildCreate, async (guild) => {
+    try {
+      let inviterId: string | null = null;
+      try {
+        const logs = await guild.fetchAuditLogs({ type: AuditLogEvent.BotAdd, limit: 1 });
+        const entry = logs.entries.first();
+        if (entry && entry.target?.id === client.user?.id) {
+          inviterId = entry.executor?.id ?? null;
+        }
+      } catch {
+        // Audit log permissions may not be granted
+      }
+
+      const channel = guild.systemChannel ?? guild.channels.cache.find(c => c.isTextBased() && 'send' in c);
+      if (channel && 'send' in channel) {
+        const greeting = inviterId ? `👋 Thanks for inviting me, <@${inviterId}>!` : `👋 Thanks for inviting me!`;
+        await (channel as GuildTextBasedChannel).send({
+          content: `${greeting} I'm your AI Music Companion.\nJoin a voice channel and type </join:0> or </play:0> to open your music controller.`,
+          ...makePanel(guild.id, inviterId ?? undefined)
+        }).catch(() => undefined);
+      }
+    } catch (err) {
+      log('warn', 'guild_create_greeting_failed', { guildId: guild.id, error: err });
+    }
+  });
+
   client.once(Events.ClientReady, (readyClient) => {
     log('info', 'discord_client_ready', { tag: readyClient.user.tag, guildCountOnShard: readyClient.guilds.cache.size });
   });

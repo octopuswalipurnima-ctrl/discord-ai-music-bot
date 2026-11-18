@@ -34,12 +34,15 @@ let playerState = {
   guildId: mockGuild.id,
   guildName: mockGuild.name,
   current: {
-    title: 'Midnight Lo-Fi Chill Hop (Verified Stream)',
-    url: 'https://cdn.example.com/audio/track1.mp3',
+    title: 'Rihaee',
+    artist: 'Suzonn',
+    url: 'https://cdn.example.com/audio/rihaee-suzonn.mp3',
     requestedBy: mockUser.id,
-    artist: 'Antigravity Sound Lab',
-    bpm: 85,
-    energy: 40
+    durationSeconds: 182,
+    bpm: 88,
+    energy: 55,
+    genreTags: ['indie', 'acoustic', 'chill'],
+    moodTags: ['chill', 'nostalgic']
   } as any,
   queue: [
     { title: 'Sunset Cyberwave Drive', url: 'https://cdn.example.com/audio/track2.mp3', requestedBy: mockUser.id, artist: 'SynthRunner' },

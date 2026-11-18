@@ -39,6 +39,9 @@ interface GuildPlayer {
   queueRestored: boolean;
   /** Bumped by stop/destroy so an in-flight startNext() can tell it has been cancelled. */
   epoch: number;
+  summonedBy?: string;
+  voiceChannelId?: string;
+  voiceChannelName?: string;
 }
 
 export interface PlayerSnapshot {
@@ -50,6 +53,10 @@ export interface PlayerSnapshot {
   volume: number;
   paused: boolean;
   connected: boolean;
+  playbackDurationMs?: number;
+  summonedBy?: string;
+  voiceChannelId?: string;
+  voiceChannelName?: string;
 }
 
 const sessions = new Map<string, GuildPlayer>();
@@ -123,7 +130,7 @@ async function startNext(state: GuildPlayer): Promise<void> {
   if (!state.current && state.queue.length && state.epoch === epoch) void startNext(state);
 }
 
-function createSession(guild: Guild, voiceChannel: VoiceBasedChannel, textChannel: GuildTextBasedChannel, leaseToken: string): GuildPlayer {
+function createSession(guild: Guild, voiceChannel: VoiceBasedChannel, textChannel: GuildTextBasedChannel, leaseToken: string, summonedBy?: string): GuildPlayer {
   const connection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId: guild.id,
@@ -152,7 +159,10 @@ function createSession(guild: Guild, voiceChannel: VoiceBasedChannel, textChanne
     leaseToken,
     leaseRenewal: null,
     queueRestored: false,
-    epoch: 0
+    epoch: 0,
+    summonedBy,
+    voiceChannelId: voiceChannel.id,
+    voiceChannelName: voiceChannel.name
   };
 
   state.leaseRenewal = setInterval(() => {
@@ -221,12 +231,12 @@ function createSession(guild: Guild, voiceChannel: VoiceBasedChannel, textChanne
   return state;
 }
 
-async function openSession(guild: Guild, voiceChannel: VoiceBasedChannel, textChannel: GuildTextBasedChannel): Promise<GuildPlayer> {
+async function openSession(guild: Guild, voiceChannel: VoiceBasedChannel, textChannel: GuildTextBasedChannel, summonedBy?: string): Promise<GuildPlayer> {
   const leaseToken = await acquireGuildLease(guild.id);
   if (!leaseToken) throw new Error('Another music worker currently owns this server voice session. Try again in a moment.');
   let state: GuildPlayer | undefined;
   try {
-    state = createSession(guild, voiceChannel, textChannel, leaseToken);
+    state = createSession(guild, voiceChannel, textChannel, leaseToken, summonedBy);
     await entersState(state.connection, VoiceConnectionStatus.Ready, 20_000);
     const recovered = await loadUpcomingQueue(guild.id);
     for (const queuedTrack of recovered) {
@@ -250,16 +260,38 @@ async function openSession(guild: Guild, voiceChannel: VoiceBasedChannel, textCh
 }
 
 /** One session per guild, even when several members run /play at the same moment. */
-function getOrCreateSession(guild: Guild, voiceChannel: VoiceBasedChannel, textChannel: GuildTextBasedChannel): Promise<GuildPlayer> {
+function getOrCreateSession(guild: Guild, voiceChannel: VoiceBasedChannel, textChannel: GuildTextBasedChannel, summonedBy?: string): Promise<GuildPlayer> {
   const pending = pendingSessions.get(guild.id);
   if (pending) return pending;
   const existing = sessions.get(guild.id);
-  if (existing) return Promise.resolve(existing);
-  const creating = openSession(guild, voiceChannel, textChannel).finally(() => {
+  if (existing) {
+    if (summonedBy) existing.summonedBy = summonedBy;
+    existing.voiceChannelId = voiceChannel.id;
+    existing.voiceChannelName = voiceChannel.name;
+    return Promise.resolve(existing);
+  }
+  const creating = openSession(guild, voiceChannel, textChannel, summonedBy).finally(() => {
     if (pendingSessions.get(guild.id) === creating) pendingSessions.delete(guild.id);
   });
   pendingSessions.set(guild.id, creating);
   return creating;
+}
+
+export async function connectToVoice(
+  guild: Guild,
+  voiceChannel: VoiceBasedChannel,
+  textChannel: GuildTextBasedChannel,
+  summonedBy?: string
+): Promise<GuildPlayer> {
+  const state = await getOrCreateSession(guild, voiceChannel, textChannel, summonedBy);
+  if (state.connection.joinConfig.channelId !== voiceChannel.id) {
+    throw new Error('I am already connected to another voice channel in this server.');
+  }
+  state.textChannel = textChannel;
+  if (summonedBy) state.summonedBy = summonedBy;
+  state.voiceChannelId = voiceChannel.id;
+  state.voiceChannelName = voiceChannel.name;
+  return state;
 }
 
 export async function enqueueTrack(
@@ -269,11 +301,14 @@ export async function enqueueTrack(
   track: Track
 ): Promise<{ position: number; started: boolean }> {
   validateConfiguredAudioUrl(track.url);
-  const state = await getOrCreateSession(guild, voiceChannel, textChannel);
+  const state = await getOrCreateSession(guild, voiceChannel, textChannel, track.requestedBy);
   if (state.connection.joinConfig.channelId !== voiceChannel.id) {
     throw new Error('I am already playing in another voice channel in this server.');
   }
   state.textChannel = textChannel;
+  if (!state.summonedBy) state.summonedBy = track.requestedBy;
+  state.voiceChannelId = voiceChannel.id;
+  state.voiceChannelName = voiceChannel.name;
   if (state.queue.length >= config.MAX_QUEUE_SIZE) throw new Error(`The queue is full (limit ${config.MAX_QUEUE_SIZE}).`);
   const wasIdle = !state.current && !state.starting;
   state.queue.push(track);
@@ -303,8 +338,54 @@ export function getSnapshot(guildId: string): PlayerSnapshot | null {
     repeatMode: state.repeatMode,
     volume: state.volume,
     paused: state.player.state.status === AudioPlayerStatus.Paused,
-    connected: state.connection.state.status === VoiceConnectionStatus.Ready
+    connected: state.connection.state.status === VoiceConnectionStatus.Ready,
+    playbackDurationMs: state.currentResource?.playbackDuration ?? 0,
+    summonedBy: state.summonedBy,
+    voiceChannelId: state.voiceChannelId,
+    voiceChannelName: state.voiceChannelName
   };
+}
+
+export function replayTrack(guildId: string): boolean {
+  const state = sessions.get(guildId);
+  if (!state || !state.current) return false;
+  state.queue.unshift(state.current);
+  state.skipRequested = true;
+  state.player.stop(true);
+  return true;
+}
+
+export function adjustVolume(guildId: string, delta: number): number | null {
+  const state = sessions.get(guildId);
+  if (!state) return null;
+  const target = Math.max(0, Math.min(100, state.volume + delta));
+  setVolume(guildId, target);
+  return target;
+}
+
+export function cycleRepeatMode(guildId: string): RepeatMode | null {
+  const state = sessions.get(guildId);
+  if (!state) return null;
+  const modes: RepeatMode[] = ['off', 'track', 'queue'];
+  const next = modes[(modes.indexOf(state.repeatMode) + 1) % modes.length] ?? 'off';
+  setRepeatMode(guildId, next);
+  return next;
+}
+
+export function shuffleQueue(guildId: string): boolean {
+  const state = sessions.get(guildId);
+  if (!state || state.queue.length <= 1) return false;
+  for (let i = state.queue.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const trackI = state.queue[i];
+    const trackJ = state.queue[j];
+    if (trackI && trackJ) {
+      state.queue[i] = trackJ;
+      state.queue[j] = trackI;
+    }
+  }
+  void persistUpcomingQueue(state);
+  return true;
 }
 
 export function pausePlayback(guildId: string): boolean {
