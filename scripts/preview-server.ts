@@ -28,6 +28,8 @@ const mockUser = {
   avatar: null
 };
 
+let activeUserRole = 'owner'; // 'owner' | 'moderator' | 'member'
+
 let playerState = {
   guildId: mockGuild.id,
   guildName: mockGuild.name,
@@ -38,14 +40,15 @@ let playerState = {
     artist: 'Antigravity Sound Lab',
     bpm: 85,
     energy: 40
-  },
+  } as any,
   queue: [
     { title: 'Sunset Cyberwave Drive', url: 'https://cdn.example.com/audio/track2.mp3', requestedBy: mockUser.id, artist: 'SynthRunner' },
     { title: 'Morning Coffee Acoustic', url: 'https://cdn.example.com/audio/track3.mp3', requestedBy: mockUser.id, artist: 'Coffee Acoustic' },
     { title: 'Deep Focus Ambient Drone', url: 'https://cdn.example.com/audio/track4.mp3', requestedBy: mockUser.id, artist: 'FocusLab' }
   ],
   repeatMode: 'off' as 'off' | 'track' | 'queue',
-  volume: 70
+  volume: 70,
+  paused: false
 };
 
 let djState = {
@@ -56,13 +59,25 @@ let djState = {
 };
 
 let serverSettings = {
-  moderatorRoleId: null as string | null,
+  moderatorRoleId: '111111111111111111',
   updatedBy: mockUser.id,
   updatedAt: new Date().toISOString()
 };
 
+interface PlaylistTrack {
+  title: string;
+  url: string;
+  requestedBy: string;
+}
+
+const userPlaylists = new Map<string, PlaylistTrack[]>();
+userPlaylists.set('Night Coding Session', [
+  { title: 'Cyberwave Horizon', url: 'https://cdn.example.com/cyber.mp3', requestedBy: mockUser.id },
+  { title: 'Rainy Night in Tokyo', url: 'https://cdn.example.com/rain.mp3', requestedBy: mockUser.id }
+]);
+
 const playlistQuotas = new Map<string, { count: number; limit: number }>();
-playlistQuotas.set(mockUser.id, { count: 1, limit: 2 });
+playlistQuotas.set(mockUser.id, { count: 1, limit: 3 });
 
 let historyConsent = true;
 
@@ -71,16 +86,110 @@ app.get('/', (_req: Request, res: Response) => {
   res.type('html').send(DASHBOARD_HTML);
 });
 
-// API Routes mimicking the Discord bot dashboard
+// Magic Token Login (Simulating /dashboard link in Discord)
+app.get('/auth/token', (req: Request, res: Response) => {
+  const roleParam = String(req.query.role || '').toLowerCase();
+  if (['owner', 'admin', 'moderator', 'member'].includes(roleParam)) {
+    activeUserRole = roleParam === 'admin' ? 'moderator' : roleParam;
+  }
+  res.redirect(`/?guild=${mockGuild.id}`);
+});
+
+// User profile & Server Permissions
 app.get('/api/me', (_req: Request, res: Response) => {
   res.json({
     user: mockUser,
     csrfToken: 'local-test-csrf-token',
     guilds: [mockGuild],
-    memberGuilds: [mockGuild]
+    memberGuilds: [mockGuild],
+    activeRole: activeUserRole,
+    roleInfo: {
+      guildId: mockGuild.id,
+      guildName: mockGuild.name,
+      role: activeUserRole,
+      title: activeUserRole === 'owner' ? 'Server Owner' : activeUserRole === 'moderator' ? 'Music Moderator' : 'Member'
+    }
   });
 });
 
+// Playlists Endpoints (New Feature!)
+app.get('/api/guilds/:guildId/playlists', (_req: Request, res: Response) => {
+  const playlists = Array.from(userPlaylists.entries()).map(([name, tracks]) => ({
+    name,
+    trackCount: tracks.length,
+    createdAt: new Date().toISOString()
+  }));
+  const quota = { count: playlists.length, limit: playlistQuotas.get(mockUser.id)?.limit || 2 };
+  res.json({ playlists, quota });
+});
+
+app.post('/api/guilds/:guildId/playlists', (req: Request, res: Response) => {
+  const name = String(req.body?.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'Playlist name is required.' });
+  if (userPlaylists.has(name)) return res.status(409).json({ error: 'A playlist with that name already exists.' });
+  const quota = playlistQuotas.get(mockUser.id) || { count: userPlaylists.size, limit: 2 };
+  if (userPlaylists.size >= quota.limit) return res.status(403).json({ error: 'You have reached your playlist limit.' });
+
+  userPlaylists.set(name, []);
+  res.json({ ok: true, playlist: { name, trackCount: 0 }, quota: { count: userPlaylists.size, limit: quota.limit } });
+});
+
+app.delete('/api/guilds/:guildId/playlists/:name', (req: Request, res: Response) => {
+  const name = String(req.params.name || '').trim();
+  if (!userPlaylists.has(name)) return res.status(404).json({ error: 'Playlist not found.' });
+  userPlaylists.delete(name);
+  res.json({ ok: true, quota: { count: userPlaylists.size, limit: playlistQuotas.get(mockUser.id)?.limit || 2 } });
+});
+
+app.get('/api/guilds/:guildId/playlists/:name/tracks', (req: Request, res: Response) => {
+  const name = String(req.params.name || '').trim();
+  const tracks = userPlaylists.get(name) || [];
+  res.json({ tracks });
+});
+
+app.post('/api/guilds/:guildId/playlists/:name/tracks', (req: Request, res: Response) => {
+  const name = String(req.params.name || '').trim();
+  const tracks = userPlaylists.get(name);
+  if (!tracks) return res.status(404).json({ error: 'Playlist not found.' });
+  const url = String(req.body?.url || '').trim();
+  const title = String(req.body?.title || '').trim() || url.split('/').pop() || 'Track';
+  if (!url) return res.status(400).json({ error: 'Audio stream URL is required.' });
+
+  tracks.push({ title, url, requestedBy: mockUser.id });
+  res.json({ ok: true, tracks });
+});
+
+app.delete('/api/guilds/:guildId/playlists/:name/tracks/:position', (req: Request, res: Response) => {
+  const name = String(req.params.name || '').trim();
+  const pos = Number(req.params.position);
+  const tracks = userPlaylists.get(name);
+  if (!tracks) return res.status(404).json({ error: 'Playlist not found.' });
+  if (pos < 1 || pos > tracks.length) return res.status(400).json({ error: 'Invalid position.' });
+
+  tracks.splice(pos - 1, 1);
+  res.json({ ok: true, tracks });
+});
+
+app.post('/api/guilds/:guildId/playlists/:name/play', (req: Request, res: Response) => {
+  const name = String(req.params.name || '').trim();
+  const tracks = userPlaylists.get(name);
+  if (!tracks || !tracks.length) return res.status(400).json({ error: 'Playlist is empty.' });
+
+  for (const t of tracks) {
+    playerState.queue.push({
+      title: t.title,
+      url: t.url,
+      requestedBy: mockUser.id,
+      artist: 'Playlist: ' + name
+    });
+  }
+  if (!playerState.current) {
+    playerState.current = playerState.queue.shift();
+  }
+  res.json({ ok: true, added: tracks.length });
+});
+
+// Player & Actions
 app.get('/api/guilds/:guildId/player', (_req: Request, res: Response) => {
   res.json(playerState);
 });
@@ -89,8 +198,10 @@ app.post('/api/guilds/:guildId/action', (req: Request, res: Response) => {
   const { action, volume, mode } = req.body || {};
   switch (action) {
     case 'pause':
+      playerState.paused = true;
       break;
     case 'resume':
+      playerState.paused = false;
       break;
     case 'skip':
       if (playerState.queue.length > 0) {
@@ -102,6 +213,7 @@ app.post('/api/guilds/:guildId/action', (req: Request, res: Response) => {
     case 'stop':
       playerState.current = null;
       playerState.queue = [];
+      playerState.paused = false;
       break;
     case 'clear-queue':
       playerState.queue = [];
@@ -109,6 +221,7 @@ app.post('/api/guilds/:guildId/action', (req: Request, res: Response) => {
     case 'leave':
       playerState.current = null;
       playerState.queue = [];
+      playerState.paused = false;
       break;
     case 'volume':
       if (typeof volume === 'number') playerState.volume = Math.max(0, Math.min(100, volume));
@@ -121,7 +234,7 @@ app.post('/api/guilds/:guildId/action', (req: Request, res: Response) => {
 });
 
 app.get('/api/guilds/:guildId/settings', (_req: Request, res: Response) => {
-  res.json({ settings: serverSettings, isOwner: true });
+  res.json({ settings: serverSettings, isOwner: activeUserRole === 'owner' });
 });
 
 app.post('/api/guilds/:guildId/settings/mod-role', (req: Request, res: Response) => {
@@ -172,14 +285,17 @@ app.post('/api/guilds/:guildId/playlist-entitlement', (req: Request, res: Respon
 
 app.get('/api/personal/:guildId/taste', (_req: Request, res: Response) => {
   res.json({
-    enabled: historyConsent,
-    topGenres: ['lo-fi', 'synthwave', 'ambient', 'indie'],
-    topArtists: ['Antigravity Sound Lab', 'SynthRunner'],
+    historyEnabled: historyConsent,
+    topGenres: ['lo-fi', 'synthwave', 'ambient', 'indie rock'],
+    topArtists: ['Antigravity Sound Lab', 'SynthRunner', 'ChilledCow'],
     likedTracks: ['Midnight Lo-Fi Chill Hop'],
     dislikedTracks: [],
-    recentHistory: [
-      { title: 'Midnight Lo-Fi Chill Hop', playedAt: new Date(Date.now() - 300000).toISOString() },
-      { title: 'Sunset Cyberwave Drive', playedAt: new Date(Date.now() - 900000).toISOString() }
+    totalPlays: 14,
+    likes: 3,
+    dislikes: 0,
+    recentTracks: [
+      { title: 'Midnight Lo-Fi Chill Hop', artist: 'Antigravity Sound Lab' },
+      { title: 'Sunset Cyberwave Drive', artist: 'SynthRunner' }
     ]
   });
 });
@@ -187,24 +303,26 @@ app.get('/api/personal/:guildId/taste', (_req: Request, res: Response) => {
 app.post('/api/personal/:guildId/consent', (req: Request, res: Response) => {
   historyConsent = Boolean(req.body?.enabled);
   res.json({
-    enabled: historyConsent,
+    historyEnabled: historyConsent,
     topGenres: ['lo-fi', 'synthwave'],
     topArtists: ['Antigravity Sound Lab'],
-    likedTracks: [],
-    dislikedTracks: [],
-    recentHistory: []
+    totalPlays: 14,
+    likes: 3,
+    dislikes: 0,
+    recentTracks: []
   });
 });
 
 app.post('/api/personal/:guildId/forget', (_req: Request, res: Response) => {
   historyConsent = false;
   res.json({
-    enabled: false,
+    historyEnabled: false,
     topGenres: [],
     topArtists: [],
-    likedTracks: [],
-    dislikedTracks: [],
-    recentHistory: []
+    totalPlays: 0,
+    likes: 0,
+    dislikes: 0,
+    recentTracks: []
   });
 });
 

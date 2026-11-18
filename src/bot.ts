@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -12,6 +13,7 @@ import {
   type GuildTextBasedChannel,
   type VoiceBasedChannel
 } from 'discord.js';
+import { config } from './config.js';
 import { displayTitleFromUrl, validateConfiguredAudioUrl, type Track } from './audio-source.js';
 import {
   clearUpcomingQueue, destroySession, enqueueTrack, getSnapshot, pausePlayback, resumePlayback, setRepeatMode,
@@ -27,6 +29,7 @@ import type { MoodName } from './dj-types.js';
 import { enforceCommandRateLimit, consumeRateLimit } from './rate-limit.js';
 import { incrementMetric } from './metrics.js';
 import { log } from './logger.js';
+import { saveDashboardAuthToken } from './queue-store.js';
 import {
   forgetPersonalMusicData, getAssistantRecommendations, getPersonalHistory, getPersonalRecommendations,
   getPersonalTasteOverview, recordPersonalFeedback, setPersonalHistoryConsent
@@ -444,6 +447,70 @@ async function executeAskMusic(interaction: ChatInputCommandInteraction): Promis
 async function executeCommand(interaction: ChatInputCommandInteraction): Promise<void> {
   await enforceCommandRateLimit(interaction.guildId ?? 'dm', interaction.user.id, interaction.commandName);
   incrementMetric('discord_commands_total', { command: interaction.commandName });
+  if (interaction.commandName === 'dashboard') {
+    const guild = interaction.guild;
+    if (!guild) throw new Error('Use this command inside a server.');
+    const member = await guild.members.fetch(interaction.user.id).catch(() => null);
+    if (!member) throw new Error('Could not fetch your server member profile.');
+
+    const settings = await getServerSettings(guild.id);
+    const isOwner = guild.ownerId === interaction.user.id;
+    const isAdmin = member.permissions.has(PermissionFlagsBits.Administrator) || member.permissions.has(PermissionFlagsBits.ManageGuild);
+    const isMod = Boolean(settings.moderatorRoleId && member.roles.cache.has(settings.moderatorRoleId));
+
+    let role = 'member';
+    let roleTitle = 'Member';
+    let roleDesc = 'Personal Playlists, Personal AI Taste Profile & Queue Viewing';
+    if (isOwner) {
+      role = 'owner';
+      roleTitle = 'Server Owner';
+      roleDesc = 'Full Server Control, Playlist Quota Management, Music Controls & Settings';
+    } else if (isAdmin) {
+      role = 'admin';
+      roleTitle = 'Administrator';
+      roleDesc = 'Music Controls, AI DJ Mood, Catalogue & Settings';
+    } else if (isMod) {
+      role = 'moderator';
+      roleTitle = 'Music Moderator';
+      roleDesc = 'Music Playback Controls, AI DJ Mood & Catalogue';
+    }
+
+    const authToken = randomBytes(24).toString('hex');
+    await saveDashboardAuthToken(authToken, {
+      userId: interaction.user.id,
+      username: interaction.user.username,
+      avatar: interaction.user.displayAvatarURL(),
+      guildId: guild.id,
+      guildName: guild.name,
+      role,
+      title: roleTitle
+    });
+
+    const dashUrl = `${config.DASHBOARD_URL}/auth/token?token=${authToken}`;
+
+    const embed = new EmbedBuilder()
+      .setColor(role === 'owner' ? 0xf59e0b : role === 'admin' ? 0xec4899 : role === 'moderator' ? 0x3b82f6 : 0x10b981)
+      .setTitle(`🎵 ${guild.name} — Web Music Dashboard`)
+      .setDescription(
+        `Here is your private, direct access link to the web music dashboard:\n\n` +
+        `**Your Role:** \`${roleTitle}\`\n` +
+        `**Capabilities:** ${roleDesc}\n\n` +
+        `🔗 **[Click here to Open Dashboard](${dashUrl})**\n\n` +
+        `*This link records your role in this server so the dashboard shows only what you can modify and use. It expires in 15 minutes.*`
+      )
+      .setFooter({ text: 'Discord AI Music Bot • Role-Synced Dashboard' });
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setLabel('Open Web Dashboard')
+        .setStyle(ButtonStyle.Link)
+        .setURL(dashUrl)
+    );
+
+    await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+    return;
+  }
+
   if (interaction.commandName === 'playlist') return executePlaylist(interaction);
   if (interaction.commandName === 'music-admin') return executeMusicAdmin(interaction);
   if (interaction.commandName === 'mood') return executeMood(interaction);

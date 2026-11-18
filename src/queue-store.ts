@@ -65,6 +65,86 @@ export async function clearUpcomingQueueSnapshot(guildId: string): Promise<void>
   await redis.del(queueKey(guildId));
 }
 
+// ---------------------------------------------------------------------------
+// Cross-Shard Shared State & Command Bus (Resolves Phase 5 Known Boundary)
+// ---------------------------------------------------------------------------
+
+function playerSnapshotKey(guildId: string): string { return `music:player:${guildId}`; }
+function guildInfoKey(guildId: string): string { return `music:guild_info:${guildId}`; }
+const DASHBOARD_TOKEN_TTL_SECONDS = 900; // 15 minutes
+
+export async function savePlayerSnapshot(guildId: string, snapshot: unknown): Promise<void> {
+  try {
+    if (!redis.isReady) return;
+    await redis.set(playerSnapshotKey(guildId), JSON.stringify(snapshot), { EX: 3600 });
+  } catch {
+    // Non-fatal if Redis snapshot write fails
+  }
+}
+
+export async function loadPlayerSnapshot<T = unknown>(guildId: string): Promise<T | null> {
+  try {
+    if (!redis.isReady) return null;
+    const raw = await redis.get(playerSnapshotKey(guildId));
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function clearPlayerSnapshot(guildId: string): Promise<void> {
+  try {
+    if (!redis.isReady) return;
+    await redis.del(playerSnapshotKey(guildId));
+  } catch {
+    // Ignore cleanup error
+  }
+}
+
+export async function saveDashboardAuthToken(token: string, payload: unknown): Promise<void> {
+  try {
+    if (!redis.isReady) return;
+    await redis.set(`music:dash_token:${token}`, JSON.stringify(payload), { EX: DASHBOARD_TOKEN_TTL_SECONDS });
+  } catch {
+    // Non-fatal
+  }
+}
+
+export async function getDashboardAuthToken<T = unknown>(token: string): Promise<T | null> {
+  try {
+    if (!redis.isReady) return null;
+    const raw = await redis.get(`music:dash_token:${token}`);
+    if (raw) await redis.del(`music:dash_token:${token}`).catch(() => undefined);
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function registerShardGuilds(
+  shardId: number,
+  guilds: Array<{ id: string; name: string; icon: string | null; ownerId: string }>
+): Promise<void> {
+  try {
+    if (!redis.isReady) return;
+    for (const g of guilds) {
+      await redis.set(guildInfoKey(g.id), JSON.stringify({ ...g, shardId }), { EX: 86400 });
+    }
+  } catch {
+    // Non-fatal
+  }
+}
+
+export async function getGuildFromSharedRegistry(guildId: string): Promise<{ id: string; name: string; icon: string | null; ownerId: string; shardId: number } | null> {
+  try {
+    if (!redis.isReady) return null;
+    const raw = await redis.get(guildInfoKey(guildId));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function getQueueStoreHealth(): Promise<{ ready: boolean; ping: boolean }> {
   const ready = redis.isReady;
   let ping = false;

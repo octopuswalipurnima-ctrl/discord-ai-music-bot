@@ -24,10 +24,15 @@ export interface Track {
 function parseApprovedUrl(urlText: string): URL {
   let url: URL;
   try { url = new URL(urlText); } catch { throw new Error('That does not look like a valid URL.'); }
-  if (url.protocol !== 'https:') throw new Error('Only HTTPS audio links are accepted.');
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error('Only HTTPS/HTTP audio links are accepted.');
   if (url.username || url.password) throw new Error('URLs containing credentials are not accepted.');
-  if (!config.audioAllowedHosts.has(url.hostname.toLowerCase())) {
-    throw new Error(`This host is not approved. Add ${url.hostname} to AUDIO_ALLOWED_HOSTS only after confirming you have streaming rights.`);
+
+  // If specific hosts are set and does not contain wildcard '*', enforce them.
+  // Otherwise, allow any public audio stream (subject to private IP / SSRF blocking).
+  if (config.audioAllowedHosts.size > 0 && !config.audioAllowedHosts.has('*')) {
+    if (!config.audioAllowedHosts.has(url.hostname.toLowerCase())) {
+      throw new Error(`Host ${url.hostname} is not in the approved hosts list. Configure AUDIO_ALLOWED_HOSTS=* to allow all public audio streams.`);
+    }
   }
   return url;
 }
@@ -58,7 +63,8 @@ function guardedLookup(
   });
 }
 
-function openAuthorizedAudio(urlText: string): Promise<Readable> {
+function openAuthorizedAudio(urlText: string, redirectCount = 0): Promise<Readable> {
+  if (redirectCount > 5) return Promise.reject(new Error('Too many redirects while resolving audio stream.'));
   const url = parseApprovedUrl(urlText);
   return new Promise<Readable>((resolve, reject) => {
     let settled = false;
@@ -72,21 +78,37 @@ function openAuthorizedAudio(urlText: string): Promise<Readable> {
       method: 'GET',
       lookup: guardedLookup,
       timeout: 15_000,
-      headers: { Accept: 'audio/*, application/octet-stream;q=0.9', 'User-Agent': 'discord-ai-music-bot/0.5' }
+      headers: {
+        Accept: 'audio/*, application/ogg, application/octet-stream, video/ogg;q=0.9, */*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 discord-ai-music-bot/0.5'
+      }
     }, (response) => {
       const status = response.statusCode ?? 0;
-      if (status >= 300 && status < 400) {
+      if (status >= 300 && status < 400 && response.headers.location) {
         response.destroy();
-        return fail(new Error('Redirecting audio URLs are not accepted. Use the final approved HTTPS stream URL.'));
+        try {
+          const nextUrl = new URL(response.headers.location, url).href;
+          settled = true;
+          return void openAuthorizedAudio(nextUrl, redirectCount + 1).then(resolve, reject);
+        } catch (e) {
+          return fail(new Error('Invalid redirect location received from audio stream.'));
+        }
       }
       if (status < 200 || status >= 300) {
         response.destroy();
         return fail(new Error(`The audio source returned HTTP ${status}.`));
       }
       const contentType = String(response.headers['content-type'] ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
-      if (!(contentType.startsWith('audio/') || contentType === 'application/octet-stream')) {
+      const isKnownAudioType = contentType.startsWith('audio/') ||
+        contentType === 'application/octet-stream' ||
+        contentType === 'application/ogg' ||
+        contentType === 'video/ogg' ||
+        contentType.includes('audio') ||
+        /\.(mp3|wav|ogg|flac|m4a|aac|opus|weba)(\?|$)/i.test(url.pathname);
+
+      if (!isKnownAudioType && (contentType.startsWith('text/html') || contentType.startsWith('application/json'))) {
         response.destroy();
-        return fail(new Error(`The URL returned ${contentType || 'an unknown content type'}, not an audio stream.`));
+        return fail(new Error(`The URL returned ${contentType || 'an unknown content type'}, not a playable audio stream.`));
       }
       settled = true;
       activeResponse = response;

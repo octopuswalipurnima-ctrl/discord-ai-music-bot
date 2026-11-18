@@ -95,7 +95,12 @@ const musicAdmin = new SlashCommandBuilder()
   .addSubcommand((sub) => sub.setName('settings').setDescription('Show this server music configuration'))
   .addSubcommand((sub) => sub.setName('clear-queue').setDescription('Moderator: remove all upcoming tracks'));
 
+const dashboard = new SlashCommandBuilder()
+  .setName('dashboard')
+  .setDescription('Get a private, direct link to the web music dashboard with your server role');
+
 export const commands = [
+  dashboard,
   new SlashCommandBuilder().setName('play').setDescription('Play an approved stream URL or a track from this server catalogue')
     .addStringOption((o) => o.setName('url').setDescription('Direct HTTPS audio URL').setRequired(false).setMaxLength(1500))
     .addIntegerOption((o) => o.setName('catalogue_id').setDescription('Track ID from /catalog search').setRequired(false).setMinValue(1))
