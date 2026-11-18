@@ -1,0 +1,43 @@
+{
+  "name": "discord-ai-music-bot",
+  "version": "0.5.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-server Discord AI music bot with Redis coordination, sharding, rate limits, observability, per-user playlists and AI DJ.",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json",
+    "register": "tsx src/register-commands.ts",
+    "register:build": "node dist/register-commands.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "preview": "tsx scripts/preview-server.ts",
+    "start:worker": "node dist/worker.js"
+  },
+  "dependencies": {
+    "@discordjs/opus": "^0.4.0",
+    "@discordjs/voice": "^0.19.2",
+    "connect-pg-simple": "^10.0.0",
+    "discord.js": "^14.27.0",
+    "dotenv": "^16.6.1",
+    "express": "^5.1.0",
+    "express-session": "^1.18.2",
+    "ffmpeg-static": "^5.2.0",
+    "pg": "^8.16.3",
+    "zod": "^4.1.12",
+    "redis": "^5.8.2"
+  },
+  "devDependencies": {
+    "@types/connect-pg-simple": "^7.0.3",
+    "@types/express": "^5.0.5",
+    "@types/express-session": "^1.18.2",
+    "@types/node": "^22.19.0",
+    "@types/pg": "^8.15.6",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

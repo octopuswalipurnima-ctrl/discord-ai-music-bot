@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: musicbot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_for_local_only}
+      POSTGRES_DB: musicbot
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - musicbot_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U musicbot -d musicbot"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - musicbot_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  bot:
+    build: .
+    profiles: ["app"]
+    restart: unless-stopped
+    init: true
+    # Give shards time to save queue snapshots and release voice leases on `docker compose stop`.
+    stop_grace_period: 30s
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      SHARDING_ENABLED: "true"
+      DATABASE_URL: postgres://musicbot:${POSTGRES_PASSWORD:-change_me_for_local_only}@postgres:5432/musicbot
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+
+volumes:
+  musicbot_pgdata:
+  musicbot_redisdata:
