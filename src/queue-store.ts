@@ -19,16 +19,35 @@ const LEASE_RELEASE_SCRIPT = `
   return 0
 `;
 
+const inMemoryLeases = new Map<string, { token: string; expiresAt: number }>();
+const inMemoryQueues = new Map<string, Track[]>();
+const inMemoryDashTokens = new Map<string, { payload: unknown; expiresAt: number }>();
+
 function leaseKey(guildId: string): string { return `music:lease:${guildId}`; }
 function queueKey(guildId: string): string { return `music:queue:${guildId}`; }
 
 export async function acquireGuildLease(guildId: string): Promise<string | null> {
   const token = randomUUID();
+  if (!redis.isReady) {
+    const now = Date.now();
+    const existing = inMemoryLeases.get(guildId);
+    if (existing && existing.expiresAt > now) return null;
+    inMemoryLeases.set(guildId, { token, expiresAt: now + LEASE_TTL_MS });
+    return token;
+  }
   const result = await redis.set(leaseKey(guildId), token, { NX: true, PX: LEASE_TTL_MS });
   return result === 'OK' ? token : null;
 }
 
 export async function renewGuildLease(guildId: string, token: string): Promise<boolean> {
+  if (!redis.isReady) {
+    const existing = inMemoryLeases.get(guildId);
+    if (existing && existing.token === token) {
+      existing.expiresAt = Date.now() + LEASE_TTL_MS;
+      return true;
+    }
+    return false;
+  }
   const result = await redis.eval(LEASE_RENEW_SCRIPT, {
     keys: [leaseKey(guildId)],
     arguments: [token, String(LEASE_TTL_MS)]
@@ -37,10 +56,19 @@ export async function renewGuildLease(guildId: string, token: string): Promise<b
 }
 
 export async function releaseGuildLease(guildId: string, token: string): Promise<void> {
+  if (!redis.isReady) {
+    const existing = inMemoryLeases.get(guildId);
+    if (existing && existing.token === token) inMemoryLeases.delete(guildId);
+    return;
+  }
   await redis.eval(LEASE_RELEASE_SCRIPT, { keys: [leaseKey(guildId)], arguments: [token] });
 }
 
 export async function saveUpcomingQueue(guildId: string, tracks: Track[]): Promise<void> {
+  if (!redis.isReady) {
+    inMemoryQueues.set(guildId, [...tracks.slice(0, config.MAX_QUEUE_SIZE)]);
+    return;
+  }
   const key = queueKey(guildId);
   if (tracks.length === 0) {
     await redis.del(key);
@@ -51,6 +79,9 @@ export async function saveUpcomingQueue(guildId: string, tracks: Track[]): Promi
 }
 
 export async function loadUpcomingQueue(guildId: string): Promise<Track[]> {
+  if (!redis.isReady) {
+    return inMemoryQueues.get(guildId) ?? [];
+  }
   const raw = await redis.get(queueKey(guildId));
   if (!raw) return [];
   try {
@@ -62,6 +93,10 @@ export async function loadUpcomingQueue(guildId: string): Promise<Track[]> {
 }
 
 export async function clearUpcomingQueueSnapshot(guildId: string): Promise<void> {
+  if (!redis.isReady) {
+    inMemoryQueues.delete(guildId);
+    return;
+  }
   await redis.del(queueKey(guildId));
 }
 
@@ -103,7 +138,10 @@ export async function clearPlayerSnapshot(guildId: string): Promise<void> {
 
 export async function saveDashboardAuthToken(token: string, payload: unknown): Promise<void> {
   try {
-    if (!redis.isReady) return;
+    if (!redis.isReady) {
+      inMemoryDashTokens.set(token, { payload, expiresAt: Date.now() + DASHBOARD_TOKEN_TTL_SECONDS * 1000 });
+      return;
+    }
     await redis.set(`music:dash_token:${token}`, JSON.stringify(payload), { EX: DASHBOARD_TOKEN_TTL_SECONDS });
   } catch {
     // Non-fatal
@@ -112,7 +150,16 @@ export async function saveDashboardAuthToken(token: string, payload: unknown): P
 
 export async function getDashboardAuthToken<T = unknown>(token: string): Promise<T | null> {
   try {
-    if (!redis.isReady) return null;
+    if (!redis.isReady) {
+      const entry = inMemoryDashTokens.get(token);
+      if (!entry) return null;
+      if (entry.expiresAt < Date.now()) {
+        inMemoryDashTokens.delete(token);
+        return null;
+      }
+      inMemoryDashTokens.delete(token);
+      return entry.payload as T;
+    }
     const raw = await redis.get(`music:dash_token:${token}`);
     if (raw) await redis.del(`music:dash_token:${token}`).catch(() => undefined);
     return raw ? (JSON.parse(raw) as T) : null;

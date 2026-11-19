@@ -1,26 +1,22 @@
-import { Client, GatewayIntentBits } from 'discord.js';
+import { Client, GatewayIntentBits, REST, Routes } from 'discord.js';
 import { config } from '../src/config.js';
 
-console.log('Connecting to Discord Gateway with token...');
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
-});
+async function main() {
+  console.log('Querying Discord REST API for guilds...');
+  const rest = new REST({ version: '10' }).setToken(config.DISCORD_TOKEN);
+  try {
+    const guilds = await rest.get(Routes.userGuilds()) as any[];
+    console.log(`\n========================================================`);
+    console.log(`🏰 REST API reports ${guilds.length} guilds where bot is a member:`);
+    for (const g of guilds) {
+      console.log(`   - ${g.name} (ID: ${g.id}) [Owner: ${g.owner}]`);
+    }
+    console.log(`========================================================\n`);
+  } catch (err: any) {
+    console.error('REST API error:', err.message);
+  }
+}
 
-client.once('ready', (readyClient) => {
-  console.log(`\n========================================================`);
-  console.log(`🤖 Bot Authenticated Successfully!`);
-  console.log(`🏷️  Bot Tag:     ${readyClient.user.tag}`);
-  console.log(`🆔  Bot ID:      ${readyClient.user.id}`);
-  console.log(`🏰  Guilds:      ${readyClient.guilds.cache.size}`);
-  readyClient.guilds.cache.forEach(guild => {
-    console.log(`    - ${guild.name} (ID: ${guild.id})`);
-  });
-  console.log(`========================================================\n`);
-  client.destroy();
-  process.exit(0);
-});
+main().catch(console.error);
 
-client.login(config.DISCORD_TOKEN).catch((err) => {
-  console.error('Bot login failed:', err.message);
-  process.exit(1);
-});
+

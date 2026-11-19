@@ -14,14 +14,29 @@ export interface RateLimitResult {
   retryAfterMs: number;
 }
 
+const inMemoryLimits = new Map<string, { count: number; expiresAt: number }>();
+
 export async function consumeRateLimit(
   bucket: string,
   keyParts: string[],
   limit: number,
   windowMs: number
 ): Promise<RateLimitResult> {
-  if (!redis.isReady) throw new Error('The bot safety limiter is temporarily unavailable. Please retry in a moment.');
   const key = `ratelimit:${bucket}:${keyParts.map((part) => encodeURIComponent(part)).join(':')}`;
+  if (!redis.isReady) {
+    const now = Date.now();
+    const entry = inMemoryLimits.get(key);
+    if (!entry || entry.expiresAt <= now) {
+      inMemoryLimits.set(key, { count: 1, expiresAt: now + windowMs });
+      return { allowed: true, remaining: limit - 1, retryAfterMs: 0 };
+    }
+    entry.count++;
+    return {
+      allowed: entry.count <= limit,
+      remaining: Math.max(0, limit - entry.count),
+      retryAfterMs: Math.max(0, entry.expiresAt - now)
+    };
+  }
   const raw = await redis.eval(FIXED_WINDOW_SCRIPT, {
     keys: [key],
     arguments: [String(windowMs)]
