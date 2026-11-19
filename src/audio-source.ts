@@ -11,7 +11,6 @@ import { config } from './config.js';
 import { log } from './logger.js';
 import { isPrivateAddress } from './network-guard.js';
 
-const ytdl = new Ytdl();
 const spotify = spotifyUrlInfo(fetch);
 
 export function isYouTubeUrl(urlText: string): boolean {
@@ -202,7 +201,8 @@ export async function resolvePlayableTracks(input: string, requestedBy: string, 
   if (isYouTubeUrl(trimmed)) {
     const cleanUrl = cleanYouTubeVideoUrl(trimmed);
     try {
-      const info = await ytdl.getInfo(cleanUrl);
+      const metaYtdl = new Ytdl();
+      const info = await metaYtdl.getInfo(cleanUrl);
       const title = customTitle || info.videoDetails.title || 'YouTube Audio';
       const artist = info.videoDetails.author?.name || undefined;
       const durationSeconds = Number(info.videoDetails.lengthSeconds) || undefined;
@@ -343,7 +343,11 @@ export async function createDirectAudioResource(track: Track): Promise<StartedAu
   let input: Readable;
   if (isYouTubeUrl(track.url)) {
     const cleanUrl = cleanYouTubeVideoUrl(track.url);
-    input = ytdl.download(cleanUrl, { filter: (format) => Boolean(format.hasAudio && !format.hasVideo) }) as unknown as Readable;
+    const streamYtdl = new Ytdl();
+    input = streamYtdl.download(cleanUrl, {
+      filter: (format) => Boolean(format.hasAudio && !format.hasVideo),
+      highWaterMark: 1 << 25
+    }) as unknown as Readable;
   } else {
     input = await openAuthorizedAudio(track.url);
   }

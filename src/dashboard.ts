@@ -326,6 +326,7 @@ route.get('/api/me', isLoggedIn, (req, res) => {
     guilds,
     memberGuilds,
     activeRole,
+    activeGuildId: req.session.activeGuildId ?? null,
     roleInfo: req.session.roleInfo ?? null
   });
 });
@@ -1269,7 +1270,7 @@ export const DASHBOARD_HTML = `<!doctype html>
         const allGuilds = me.memberGuilds || me.guilds || [];
         const urlParams = new URLSearchParams(window.location.search);
         const urlGuild = urlParams.get('guild');
-        currentGuildId = urlGuild || allGuilds[0]?.id || '';
+        currentGuildId = urlGuild || me.activeGuildId || (me.roleInfo && me.roleInfo.guildId) || allGuilds[0]?.id || '';
 
         const picker = $('#server-picker');
         picker.innerHTML = allGuilds.map(g => \`<option value="\${esc(g.id)}" \${g.id === currentGuildId ? 'selected' : ''}>\${esc(g.name)}</option>\`).join('');

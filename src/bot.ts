@@ -15,6 +15,7 @@ import {
   type Client,
   type Guild,
   type GuildTextBasedChannel,
+  type Message,
   type ModalSubmitInteraction,
   type VoiceBasedChannel
 } from 'discord.js';
@@ -22,7 +23,8 @@ import { config } from './config.js';
 import { displayTitleFromUrl, resolvePlayableTracks, resolveTrackMetadata, validateConfiguredAudioUrl, type Track } from './audio-source.js';
 import {
   adjustVolume, clearUpcomingQueue, connectToVoice, cycleRepeatMode, destroySession, enqueueTrack,
-  getSnapshot, pausePlayback, replayTrack, resumePlayback, setOnTrackStart, setRepeatMode,
+  getSessionTextChannel, getSnapshot, isAutoPausedByEmptyVc, pausePlayback, replayTrack,
+  resumePlayback, setAutoPausedByEmptyVc, setOnTrackStart, setRepeatMode,
   setVolume, shuffleQueue, skipPlayback, stopPlayback
 } from './player.js';
 import {
@@ -71,24 +73,64 @@ function formatDuration(ms: number): string {
   return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 }
 
+function assertInBotVoiceChannel(interaction: ButtonInteraction | ChatInputCommandInteraction | ModalSubmitInteraction): void {
+  if (!interaction.guild) throw new Error('This control can only be used inside a server.');
+  const userVoiceState = interaction.guild.voiceStates.cache.get(interaction.user.id);
+  const userVoiceId = userVoiceState?.channelId;
+  if (!userVoiceId) {
+    throw new Error('❌ You must join the voice channel to use music controls.');
+  }
+  const botVoiceId = interaction.guild.members.me?.voice.channelId;
+  if (botVoiceId && userVoiceId !== botVoiceId) {
+    throw new Error(`❌ You must join <#${botVoiceId}> to use music controls.`);
+  }
+}
+
 function getVoiceContext(interaction: ChatInputCommandInteraction | ButtonInteraction): {
   guild: Guild; voice: VoiceBasedChannel; text: GuildTextBasedChannel;
 } {
   if (!interaction.guild) throw new Error('This command can only be used inside a server.');
-  const voice = interaction.guild.voiceStates.cache.get(interaction.user.id)?.channel ?? null;
-  if (!voice) throw new Error('Join a voice channel first.');
-  const state = getSnapshot(interaction.guild.id);
-  if (state) {
-    const botVoice = interaction.guild.members.me?.voice.channel;
-    if (botVoice && botVoice.id !== voice.id) throw new Error(`Join <#${botVoice.id}> to control the current music session.`);
-  }
+  assertInBotVoiceChannel(interaction);
+  const userVoiceState = interaction.guild.voiceStates.cache.get(interaction.user.id);
+  const voice = userVoiceState?.channel ?? (userVoiceState?.channelId ? interaction.guild.channels.cache.get(userVoiceState.channelId) as VoiceBasedChannel : null);
+  if (!voice) throw new Error('❌ You must join a voice channel first.');
   const text = interaction.channel;
   if (!text || !('send' in text)) throw new Error('I cannot send messages in this channel.');
   return { guild: interaction.guild, voice, text: text as GuildTextBasedChannel };
 }
 
-function makePanel(guildId: string, taggedUserId?: string): {
-  content?: string;
+const lastNowPlayingMessage = new Map<string, Message>();
+
+function makeNowPlayingMessage(guildId: string, track: Track): {
+  embeds: [EmbedBuilder];
+  components: [ActionRowBuilder<ButtonBuilder>];
+} {
+  const duration = track.durationSeconds ? formatDuration(track.durationSeconds * 1000) : null;
+  const embed = new EmbedBuilder()
+    .setColor(0x8b5cf6)
+    .setTitle(`🎶 Now Playing: ${track.title}`)
+    .setDescription(
+      track.artist
+        ? `Artist: **${track.artist}**${duration ? ` · ⏱️ ${duration}` : ''}`
+        : (duration ? `⏱️ Duration: **${duration}**` : 'Playing audio stream')
+    )
+    .setFooter({ text: 'Voice Channel Controls • Click Controls below to open player settings' });
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`music:open_controls:${guildId}`)
+      .setLabel('Controls')
+      .setEmoji('🎛️')
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  return {
+    embeds: [embed],
+    components: [row]
+  };
+}
+
+function makePanel(guildId: string): {
   embeds: [EmbedBuilder];
   components: ActionRowBuilder<ButtonBuilder>[];
 } {
@@ -127,14 +169,8 @@ function makePanel(guildId: string, taggedUserId?: string): {
       { name: 'Volume', value: `🔊 ${snapshot?.volume ?? 70}%`, inline: true },
       { name: 'Queue', value: `📑 ${snapshot?.queue.length ?? 0} tracks`, inline: true },
       { name: 'Repeat', value: `🔁 ${snapshot?.repeatMode ?? 'off'}`, inline: true }
-    );
-
-  const summoner = taggedUserId || snapshot?.summonedBy;
-  if (summoner) {
-    embed.setFooter({ text: `Summoned by user <@${summoner}> • All participants can use personal & queue controls` });
-  } else {
-    embed.setFooter({ text: 'All voice participants can use personal & queue controls' });
-  }
+    )
+    .setFooter({ text: 'Voice Channel Controls • Available to participants in voice' });
 
   // Row 1: Playback
   const rowPlayback = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -144,7 +180,7 @@ function makePanel(guildId: string, taggedUserId?: string): {
     new ButtonBuilder().setCustomId(`music:stop:${guildId}`).setEmoji('✖️').setStyle(ButtonStyle.Danger)
   );
 
-  // Row 2: Music (Line 1)
+  // Row 2: Music
   const rowMusic = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`music:queue:${guildId}`).setEmoji('📑').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`music:nowplaying:${guildId}`).setEmoji('🎵').setStyle(ButtonStyle.Secondary),
@@ -152,7 +188,7 @@ function makePanel(guildId: string, taggedUserId?: string): {
     new ButtonBuilder().setCustomId(`music:search:${guildId}`).setEmoji('🔍').setStyle(ButtonStyle.Secondary)
   );
 
-  // Row 3: Music (Line 2 - Mood & AI)
+  // Row 3: Music (Line 2 - Mood)
   const rowMusicCont = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`music:mood:${guildId}`).setEmoji('🎶').setStyle(ButtonStyle.Secondary)
   );
@@ -173,26 +209,16 @@ function makePanel(guildId: string, taggedUserId?: string): {
     new ButtonBuilder().setCustomId(`music:dashboard_link:${guildId}`).setEmoji('🌐').setStyle(ButtonStyle.Secondary)
   );
 
-  const result: {
-    content?: string;
-    embeds: [EmbedBuilder];
-    components: ActionRowBuilder<ButtonBuilder>[];
-  } = {
+  return {
     embeds: [embed],
     components: [rowPlayback, rowMusic, rowMusicCont, rowControls, rowLibrary]
   };
-
-  if (taggedUserId) {
-    result.content = `🎧 Joined voice channel! Summoned by <@${taggedUserId}>`;
-  }
-
-  return result;
 }
 
-async function replyError(interaction: ChatInputCommandInteraction | ButtonInteraction, error: unknown): Promise<void> {
+async function replyError(interaction: ChatInputCommandInteraction | ButtonInteraction | ModalSubmitInteraction, error: unknown): Promise<void> {
   const message = error instanceof Error ? error.message : 'Something went wrong.';
-  const payload = { content: `⚠️ ${message}`, ephemeral: true };
-  if (interaction.deferred) await interaction.editReply({ content: `⚠️ ${message}` }).catch(() => undefined);
+  const payload = { content: message.startsWith('❌') ? message : `⚠️ ${message}`, ephemeral: true };
+  if (interaction.deferred) await interaction.editReply(payload).catch(() => undefined);
   else if (interaction.replied) await interaction.followUp(payload).catch(() => undefined);
   else await interaction.reply(payload).catch(() => undefined);
 }
@@ -429,13 +455,12 @@ async function executeAiShuffle(interaction: ChatInputCommandInteraction): Promi
     }
   }
   if (!added) throw new Error('No tracks could be added. Check the approved audio streams in the catalogue.');
-  const panel = makePanel(guild.id, interaction.user.id);
+  const panel = makePanel(guild.id);
   await interaction.editReply({
     content: `AI DJ selected **${added}** tracks for **${result.mood}** mode. It balanced mood tags, genre, tempo, energy and recent-play variety.`,
     embeds: panel.embeds,
     components: panel.components
   });
-  if (firstStarted) await text.send(panel).catch(() => undefined);
 }
 
 async function executeTaste(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -510,13 +535,12 @@ async function executeForMe(interaction: ChatInputCommandInteraction): Promise<v
       break;
     }
   }
-  const forMePanel = makePanel(guild.id, interaction.user.id);
+  const forMePanel = makePanel(guild.id);
   await interaction.editReply({
     content: `**Picked for your taste**\n${list}\n\nAdded **${added}** tracks. Based on your opt-in history and feedback.`,
     embeds: forMePanel.embeds,
     components: forMePanel.components
   });
-  if (firstStarted) await text.send(forMePanel).catch(() => undefined);
 }
 
 async function executeAskMusic(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -545,13 +569,12 @@ async function executeAskMusic(interaction: ChatInputCommandInteraction): Promis
     }
   }
   const personal = result.personalised ? ' Your private taste profile was also used.' : ' Turn on `/taste opt-in` to personalise future requests.';
-  const askPanel = makePanel(guild.id, interaction.user.id);
+  const askPanel = makePanel(guild.id);
   await interaction.editReply({
     content: `**Music assistant**\nI understood: ${interpretation}.${personal}\nQueued **${added}** tracks.`,
     embeds: askPanel.embeds,
     components: askPanel.components
   });
-  if (firstStarted) await text.send(askPanel).catch(() => undefined);
 }
 
 async function executeCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -625,17 +648,17 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
     const { guild, voice, text } = getVoiceContext(interaction);
     await interaction.deferReply({ ephemeral: true });
     await connectToVoice(guild, voice, text, interaction.user.id);
-    const panel = makePanel(guild.id, interaction.user.id);
-    await text.send(panel).catch(() => undefined);
+    const panel = makePanel(guild.id);
     await interaction.editReply({
-      content: `🎧 Joined **${voice.name}** and opened the music controller. Summoned by <@${interaction.user.id}>.`,
+      content: `🎧 Joined **${voice.name}** and ready to play! Summoned by <@${interaction.user.id}>.`,
       embeds: panel.embeds,
       components: panel.components
     });
     return;
   }
   if (interaction.commandName === 'controls') {
-    return void await interaction.reply({ ...makePanel(interaction.guild!.id, interaction.user.id), ephemeral: true });
+    assertInBotVoiceChannel(interaction);
+    return void await interaction.reply({ ...makePanel(interaction.guild!.id), ephemeral: true });
   }
 
   if (interaction.commandName === 'playlist') return executePlaylist(interaction);
@@ -678,7 +701,7 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
       }
     }
 
-    const panel = makePanel(guild.id, interaction.user.id);
+    const panel = makePanel(guild.id);
     let replyMsg = '';
     if (tracks.length > 1) {
       replyMsg = `🎶 Loaded playlist with **${addedCount}** tracks! Now playing **${firstTrack.title}**.`;
@@ -698,12 +721,14 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
   if (!guild) throw new Error('This command can only be used inside a server.');
   const snapshot = getSnapshot(guild.id);
   if (interaction.commandName === 'queue') {
+    assertInBotVoiceChannel(interaction);
     if (!snapshot) return void await interaction.reply({ content: 'There is no active music session.', ephemeral: true });
     const upcoming = snapshot.queue.slice(0, 15).map((track, i) => `**${i + 1}.** ${track.title}`).join('\n') || 'No upcoming tracks.';
-    return void await interaction.reply({ embeds: [new EmbedBuilder().setColor(0x8b5cf6).setTitle('Music Queue').setDescription(`**Now:** ${snapshot.current?.title ?? 'Nothing'}\n\n${upcoming}`)] });
+    return void await interaction.reply({ embeds: [new EmbedBuilder().setColor(0x8b5cf6).setTitle('Music Queue').setDescription(`**Now:** ${snapshot.current?.title ?? 'Nothing'}\n\n${upcoming}`)], ephemeral: true });
   }
   if (interaction.commandName === 'nowplaying') {
-    return void await interaction.reply({ ...makePanel(guild.id, interaction.user.id) });
+    assertInBotVoiceChannel(interaction);
+    return void await interaction.reply({ ...makePanel(guild.id), ephemeral: true });
   }
 
   getVoiceContext(interaction);
@@ -751,6 +776,16 @@ async function executeButton(interaction: ButtonInteraction): Promise<void> {
   }
   const [, action, guildId] = interaction.customId.split(':');
   if (!guildId || guildId !== interaction.guildId) throw new Error('This control belongs to another server.');
+
+  // Only participants in the bot's voice channel can use music controls and settings
+  assertInBotVoiceChannel(interaction);
+
+  if (action === 'open_controls') {
+    return void await interaction.reply({
+      ...makePanel(guildId),
+      ephemeral: true
+    });
+  }
 
   const snapshot = getSnapshot(guildId);
 
@@ -895,33 +930,38 @@ async function executeButton(interaction: ButtonInteraction): Promise<void> {
 
   if (action === 'prev') {
     replayTrack(guildId);
-    return void await interaction.update(makePanel(guildId, interaction.user.id));
+    return void await interaction.update(makePanel(guildId));
   }
   if (action === 'play_pause') {
     if (snapshot?.paused) resumePlayback(guildId);
     else pausePlayback(guildId);
-    return void await interaction.update(makePanel(guildId, interaction.user.id));
+    return void await interaction.update(makePanel(guildId));
   }
   if (action === 'skip') {
     skipPlayback(guildId);
-    return void await interaction.update(makePanel(guildId, interaction.user.id));
+    return void await interaction.update(makePanel(guildId));
   }
   if (action === 'stop') {
     stopPlayback(guildId);
     destroySession(guildId);
-    return void await interaction.update(makePanel(guildId, interaction.user.id));
+    const prev = lastNowPlayingMessage.get(guildId);
+    if (prev) {
+      prev.delete().catch(() => undefined);
+      lastNowPlayingMessage.delete(guildId);
+    }
+    return void await interaction.update(makePanel(guildId));
   }
   if (action === 'vol_down') {
     adjustVolume(guildId, -10);
-    return void await interaction.update(makePanel(guildId, interaction.user.id));
+    return void await interaction.update(makePanel(guildId));
   }
   if (action === 'vol_up') {
     adjustVolume(guildId, +10);
-    return void await interaction.update(makePanel(guildId, interaction.user.id));
+    return void await interaction.update(makePanel(guildId));
   }
   if (action === 'repeat') {
     cycleRepeatMode(guildId);
-    return void await interaction.update(makePanel(guildId, interaction.user.id));
+    return void await interaction.update(makePanel(guildId));
   }
   if (action === 'ai_mix') {
     await interaction.deferReply({ ephemeral: true });
@@ -932,13 +972,12 @@ async function executeButton(interaction: ButtonInteraction): Promise<void> {
     for (const t of tracks) {
       await enqueueTrack(guild, voice, text, { ...t, requestedBy: interaction.user.id });
     }
-    const panel = makePanel(guildId, interaction.user.id);
-    await interaction.editReply({
+    const panel = makePanel(guildId);
+    return void await interaction.editReply({
       content: `🪄 Added **${tracks.length}** AI mood-matched tracks (**${result.mood}**) to the queue!`,
       embeds: panel.embeds,
       components: panel.components
     });
-    return void await text.send(panel).catch(() => undefined);
   }
 
   throw new Error('Unknown button action.');
@@ -948,6 +987,9 @@ async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<
   const [prefix, actionGuild] = interaction.customId.split(':');
   const guildId = actionGuild;
   if (!guildId || guildId !== interaction.guildId) throw new Error('This modal belongs to another server.');
+
+  // Only participants in the bot's voice channel can submit music modals
+  assertInBotVoiceChannel(interaction);
 
   if (prefix === 'music_modal_add') {
     const input = interaction.fields.getTextInputValue('url_or_title');
@@ -970,7 +1012,7 @@ async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<
       }
     }
 
-    const panel = makePanel(guildId, interaction.user.id);
+    const panel = makePanel(guildId);
     let replyMsg = '';
     if (tracks.length > 1) {
       replyMsg = `🎶 Loaded playlist with **${addedCount}** tracks! Now playing **${firstTrack.title}**.`;
@@ -1003,9 +1045,15 @@ async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<
 export function registerBotHandlers(client: Client): void {
   setOnTrackStart(async (guildId, track, textChannel) => {
     if (textChannel && 'send' in textChannel) {
-      await textChannel.send(makePanel(guildId, track.requestedBy)).catch((e) => {
-        log('warn', 'track_start_panel_send_failed', { guildId, error: e instanceof Error ? e.message : e });
+      const prevMsg = lastNowPlayingMessage.get(guildId);
+      if (prevMsg) {
+        prevMsg.delete().catch(() => undefined);
+      }
+      const msg = await textChannel.send(makeNowPlayingMessage(guildId, track)).catch((e) => {
+        log('warn', 'track_start_notification_send_failed', { guildId, error: e instanceof Error ? e.message : e });
+        return null;
       });
+      if (msg) lastNowPlayingMessage.set(guildId, msg);
     }
   });
 
@@ -1043,11 +1091,81 @@ export function registerBotHandlers(client: Client): void {
         const greeting = inviterId ? `👋 Thanks for inviting me, <@${inviterId}>!` : `👋 Thanks for inviting me!`;
         await (channel as GuildTextBasedChannel).send({
           content: `${greeting} I'm your AI Music Companion.\nJoin a voice channel and type </join:0> or </play:0> to open your music controller.`,
-          ...makePanel(guild.id, inviterId ?? undefined)
+          ...makePanel(guild.id)
         }).catch(() => undefined);
       }
     } catch (err) {
       log('warn', 'guild_create_greeting_failed', { guildId: guild.id, error: err });
+    }
+  });
+
+  client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+    try {
+      const guild = newState.guild ?? oldState.guild;
+      if (!guild) return;
+
+      const botMember = guild.members.me ?? await guild.members.fetchMe().catch(() => null);
+      const botVoiceChannelId = botMember?.voice.channelId;
+      if (!botVoiceChannelId) return;
+
+      // Check if the change affected the channel the bot is currently in
+      const oldChannelId = oldState.channelId;
+      const newChannelId = newState.channelId;
+      if (oldChannelId !== botVoiceChannelId && newChannelId !== botVoiceChannelId) return;
+
+      // If the voice state change was the bot itself leaving/moving, reset auto-pause
+      if (botMember && (oldState.id === botMember.id || newState.id === botMember.id)) {
+        if (newState.channelId !== botVoiceChannelId) {
+          setAutoPausedByEmptyVc(guild.id, false);
+        }
+        return;
+      }
+
+      const voiceChannel = botMember.voice.channel ?? (guild.channels.cache.get(botVoiceChannelId) as VoiceBasedChannel | null);
+      if (!voiceChannel) return;
+
+      // Count human listeners accurately taking into account old/new state transitions
+      let humanCount = 0;
+      for (const [id, member] of voiceChannel.members) {
+        if (member.user.bot) continue;
+        if (oldState.id === id && newChannelId !== botVoiceChannelId) continue;
+        humanCount++;
+      }
+      if (newChannelId === botVoiceChannelId && !newState.member?.user.bot) {
+        if (!voiceChannel.members.has(newState.id)) {
+          humanCount++;
+        }
+      }
+
+      const snapshot = getSnapshot(guild.id);
+      if (!snapshot) return;
+
+      if (humanCount === 0) {
+        // Everyone left the voice channel: pause playback without leaving VC
+        if (snapshot.current && !snapshot.paused) {
+          pausePlayback(guild.id);
+          setAutoPausedByEmptyVc(guild.id, true);
+          log('info', 'empty_vc_auto_paused', { guildId: guild.id, channelId: botVoiceChannelId });
+          const text = getSessionTextChannel(guild.id);
+          if (text && 'send' in text) {
+            await text.send('⏸️ **Everyone left the voice channel.** Playback paused automatically. I will stay in the channel and resume the instant someone joins back!').catch(() => undefined);
+          }
+        }
+      } else if (humanCount > 0) {
+        // A human entered: if paused by empty VC, resume immediately from where it paused
+        if (isAutoPausedByEmptyVc(guild.id) && snapshot.paused) {
+          resumePlayback(guild.id);
+          setAutoPausedByEmptyVc(guild.id, false);
+          log('info', 'vc_rejoined_auto_resumed', { guildId: guild.id, channelId: botVoiceChannelId, memberId: newState.id });
+          const text = getSessionTextChannel(guild.id);
+          if (text && 'send' in text) {
+            const name = newState.member?.displayName ?? 'Someone';
+            await text.send(`▶️ **${name}** joined the voice channel! Resuming playback from where it was paused.`).catch(() => undefined);
+          }
+        }
+      }
+    } catch (err) {
+      log('warn', 'voice_state_update_error', { error: err instanceof Error ? err.message : err });
     }
   });
 

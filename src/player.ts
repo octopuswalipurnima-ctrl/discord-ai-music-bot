@@ -42,6 +42,7 @@ interface GuildPlayer {
   summonedBy?: string;
   voiceChannelId?: string;
   voiceChannelName?: string;
+  autoPausedByEmptyVc?: boolean;
 }
 
 export interface PlayerSnapshot {
@@ -175,7 +176,8 @@ function createSession(guild: Guild, voiceChannel: VoiceBasedChannel, textChanne
     epoch: 0,
     summonedBy,
     voiceChannelId: voiceChannel.id,
-    voiceChannelName: voiceChannel.name
+    voiceChannelName: voiceChannel.name,
+    autoPausedByEmptyVc: false
   };
 
   state.leaseRenewal = setInterval(() => {
@@ -408,7 +410,22 @@ export function pausePlayback(guildId: string): boolean {
 
 export function resumePlayback(guildId: string): boolean {
   const state = sessions.get(guildId);
-  return state ? state.player.unpause() : false;
+  if (!state) return false;
+  state.autoPausedByEmptyVc = false;
+  return state.player.unpause();
+}
+
+export function isAutoPausedByEmptyVc(guildId: string): boolean {
+  return Boolean(sessions.get(guildId)?.autoPausedByEmptyVc);
+}
+
+export function setAutoPausedByEmptyVc(guildId: string, value: boolean): void {
+  const state = sessions.get(guildId);
+  if (state) state.autoPausedByEmptyVc = value;
+}
+
+export function getSessionTextChannel(guildId: string): GuildTextBasedChannel | null {
+  return sessions.get(guildId)?.textChannel ?? null;
 }
 
 export function skipPlayback(guildId: string): boolean {
@@ -421,6 +438,7 @@ export function skipPlayback(guildId: string): boolean {
 export function stopPlayback(guildId: string): boolean {
   const state = sessions.get(guildId);
   if (!state) return false;
+  state.autoPausedByEmptyVc = false;
   state.queue = [];
   void persistUpcomingQueue(state);
   state.repeatMode = 'off';
@@ -465,6 +483,7 @@ export function getRepeatModes(): RepeatMode[] {
 export function destroySession(guildId: string, preserveUpcomingQueue = false, writeSnapshot = true): void {
   const state = sessions.get(guildId);
   if (!state) return;
+  state.autoPausedByEmptyVc = false;
   state.stopRequested = true;
   state.epoch++;
   if (!preserveUpcomingQueue) {

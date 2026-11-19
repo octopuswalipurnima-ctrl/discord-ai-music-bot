@@ -33,7 +33,18 @@ client.once('ready', (readyClient) => {
   });
 });
 
-client.login(config.DISCORD_TOKEN).catch((error) => {
-  console.error('Failed to login:', error);
-  process.exit(1);
-});
+async function startBot(retries = 5): Promise<void> {
+  try {
+    await client.login(config.DISCORD_TOKEN);
+  } catch (error) {
+    console.error('Login attempt failed:', error instanceof Error ? error.message : error);
+    if (retries > 0) {
+      console.log(`Retrying login in 3 seconds... (${retries} retries left)`);
+      setTimeout(() => void startBot(retries - 1), 3000);
+    } else {
+      process.exit(1);
+    }
+  }
+}
+
+void startBot();
