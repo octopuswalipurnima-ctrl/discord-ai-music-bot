@@ -87,6 +87,12 @@ function releaseSessionLease(state: GuildPlayer): void {
   }
 }
 
+export type OnTrackStartHandler = (guildId: string, track: Track, textChannel: GuildTextBasedChannel | null) => void;
+let onTrackStartHandler: OnTrackStartHandler | null = null;
+export function setOnTrackStart(handler: OnTrackStartHandler): void {
+  onTrackStartHandler = handler;
+}
+
 function killCurrentProcess(state: GuildPlayer): void {
   if (state.currentProcess && !state.currentProcess.killed) state.currentProcess.kill('SIGKILL');
   state.currentProcess = null;
@@ -118,6 +124,13 @@ async function startNext(state: GuildPlayer): Promise<void> {
     state.currentResource = started.resource;
     started.resource.volume?.setVolume(state.volume / 100);
     state.player.play(started.resource);
+    if (onTrackStartHandler) {
+      try {
+        onTrackStartHandler(state.guildId, next, state.textChannel);
+      } catch (handlerError) {
+        log('warn', 'on_track_start_handler_failed', { guildId: state.guildId, error: handlerError });
+      }
+    }
   } catch (error) {
     state.current = null;
     state.currentResource = null;

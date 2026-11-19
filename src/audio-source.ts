@@ -4,9 +4,22 @@ import type { Readable } from 'node:stream';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import ffmpegPkg from 'ffmpeg-static';
 import { createAudioResource, StreamType, type AudioResource } from '@discordjs/voice';
+import { Ytdl } from '@distube/ytdl-core';
 import { config } from './config.js';
 import { log } from './logger.js';
 import { isPrivateAddress } from './network-guard.js';
+
+const ytdl = new Ytdl();
+
+export function isYouTubeUrl(urlText: string): boolean {
+  try {
+    const url = new URL(urlText);
+    const host = url.hostname.toLowerCase();
+    return host.includes('youtube.com') || host.includes('youtu.be');
+  } catch {
+    return false;
+  }
+}
 
 export interface Track {
   title: string;
@@ -39,7 +52,39 @@ function parseApprovedUrl(urlText: string): URL {
 }
 
 export function validateConfiguredAudioUrl(urlText: string): void {
+  if (isYouTubeUrl(urlText)) return;
   parseApprovedUrl(urlText);
+}
+
+export async function resolveTrackMetadata(urlText: string, requestedBy: string, customTitle?: string): Promise<Track> {
+  if (isYouTubeUrl(urlText)) {
+    try {
+      const info = await ytdl.getInfo(urlText);
+      const title = customTitle || info.videoDetails.title || 'YouTube Audio';
+      const artist = info.videoDetails.author?.name || undefined;
+      const durationSeconds = Number(info.videoDetails.lengthSeconds) || undefined;
+      return {
+        url: urlText,
+        title,
+        artist,
+        durationSeconds,
+        requestedBy
+      };
+    } catch {
+      return {
+        url: urlText,
+        title: customTitle || 'YouTube Audio',
+        requestedBy
+      };
+    }
+  }
+
+  validateConfiguredAudioUrl(urlText);
+  return {
+    url: urlText,
+    title: customTitle || displayTitleFromUrl(urlText),
+    requestedBy
+  };
 }
 
 /**
@@ -131,7 +176,14 @@ const ffmpegBinary: string | null = (ffmpegPkg as unknown as { default?: string 
 
 export async function createDirectAudioResource(track: Track): Promise<StartedAudio> {
   if (!ffmpegBinary) throw new Error('FFmpeg binary was not found. Reinstall dependencies or install FFmpeg on the host.');
-  const input = await openAuthorizedAudio(track.url);
+
+  let input: Readable;
+  if (isYouTubeUrl(track.url)) {
+    input = ytdl.download(track.url, { filter: (format) => Boolean(format.hasAudio && !format.hasVideo) }) as unknown as Readable;
+  } else {
+    input = await openAuthorizedAudio(track.url);
+  }
+
   const child = spawn(ffmpegBinary, [
     '-hide_banner', '-loglevel', 'error', '-i', 'pipe:0', '-vn',
     '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'
@@ -140,7 +192,10 @@ export async function createDirectAudioResource(track: Track): Promise<StartedAu
   let ffmpegError = '';
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', (chunk: string) => { ffmpegError = (ffmpegError + chunk).slice(-2000); });
-  input.on('error', () => child.kill('SIGKILL'));
+  input.on('error', (err) => {
+    log('error', 'audio_input_stream_error', { url: track.url, message: (err as Error).message });
+    child.kill('SIGKILL');
+  });
   child.stdin.on('error', () => undefined);
   input.pipe(child.stdin);
   child.on('close', (code: number | null) => {

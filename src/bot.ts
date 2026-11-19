@@ -19,10 +19,10 @@ import {
   type VoiceBasedChannel
 } from 'discord.js';
 import { config } from './config.js';
-import { displayTitleFromUrl, validateConfiguredAudioUrl, type Track } from './audio-source.js';
+import { displayTitleFromUrl, resolveTrackMetadata, validateConfiguredAudioUrl, type Track } from './audio-source.js';
 import {
   adjustVolume, clearUpcomingQueue, connectToVoice, cycleRepeatMode, destroySession, enqueueTrack,
-  getSnapshot, pausePlayback, replayTrack, resumePlayback, setRepeatMode,
+  getSnapshot, pausePlayback, replayTrack, resumePlayback, setOnTrackStart, setRepeatMode,
   setVolume, shuffleQueue, skipPlayback, stopPlayback
 } from './player.js';
 import {
@@ -628,20 +628,19 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
     const url = interaction.options.getString('url');
     const catalogueId = interaction.options.getInteger('catalogue_id');
     if (Boolean(url) === (catalogueId !== null)) throw new Error('Provide exactly one of `url` or `catalogue_id`.');
+    await interaction.deferReply({ ephemeral: true });
     let track: Track;
     if (catalogueId !== null) {
       const catalogTrack = await getCatalogueTrack(guild.id, catalogueId);
       if (!catalogTrack) throw new Error('That track ID is not active in this server catalogue. Use `/catalog search`.');
       track = { ...catalogTrack, requestedBy: interaction.user.id };
     } else {
-      const directUrl = url!;
-      const title = interaction.options.getString('title') || displayTitleFromUrl(directUrl);
-      track = { url: directUrl, title, requestedBy: interaction.user.id };
+      const rawUrl = url!;
+      const customTitle = interaction.options.getString('title') ?? undefined;
+      track = await resolveTrackMetadata(rawUrl, interaction.user.id, customTitle);
     }
-    await interaction.deferReply({ ephemeral: true });
     const result = await enqueueTrack(guild, voice, text, track);
     await interaction.editReply(result.started ? `Now playing **${track.title}**.` : `Added **${track.title}** to the queue at position ${result.position}.`);
-    if (result.started) await text.send(makePanel(guild.id, interaction.user.id)).catch(() => undefined);
     return;
   }
 
@@ -899,8 +898,7 @@ async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<
     const { guild, voice, text } = getVoiceContext(interaction as any);
     let track: Track;
     if (input.startsWith('http://') || input.startsWith('https://')) {
-      validateConfiguredAudioUrl(input);
-      track = { url: input, title: displayTitleFromUrl(input), requestedBy: interaction.user.id };
+      track = await resolveTrackMetadata(input, interaction.user.id);
     } else {
       const results = await searchCatalogue(guildId, input);
       if (results.length > 0 && results[0]) {
@@ -926,7 +924,6 @@ async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<
       content: result.started ? `Now playing **${track.title}**.` : `Added **${track.title}** to the queue at position ${result.position}.`,
       ephemeral: true
     });
-    if (result.started) await text.send(makePanel(guildId, interaction.user.id)).catch(() => undefined);
     return;
   }
 
@@ -945,6 +942,12 @@ async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<
 }
 
 export function registerBotHandlers(client: Client): void {
+  setOnTrackStart(async (guildId, track, textChannel) => {
+    if (textChannel && 'send' in textChannel) {
+      await textChannel.send(makePanel(guildId, track.requestedBy)).catch(() => undefined);
+    }
+  });
+
   client.on(Events.InteractionCreate, async (interaction) => {
     try {
       if (interaction.isChatInputCommand()) await executeCommand(interaction);
