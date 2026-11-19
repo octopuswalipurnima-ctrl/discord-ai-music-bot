@@ -371,7 +371,7 @@ export function replayTrack(guildId: string): boolean {
 export function adjustVolume(guildId: string, delta: number): number | null {
   const state = sessions.get(guildId);
   if (!state) return null;
-  const target = Math.max(0, Math.min(100, state.volume + delta));
+  const target = Math.max(0, Math.min(200, state.volume + delta));
   setVolume(guildId, target);
   return target;
 }
@@ -446,7 +446,7 @@ export function clearUpcomingQueue(guildId: string): number | null {
 export function setVolume(guildId: string, volume: number): boolean {
   const state = sessions.get(guildId);
   if (!state) return false;
-  state.volume = Math.max(0, Math.min(100, volume));
+  state.volume = Math.max(0, Math.min(200, volume));
   state.currentResource?.volume?.setVolume(state.volume / 100);
   return true;
 }

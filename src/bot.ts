@@ -115,9 +115,9 @@ function makePanel(guildId: string, taggedUserId?: string): {
         '**Playback**',
         '⏮️ Previous · ⏯️ Play/Pause · ⏭️ Skip · ✖️ Stop\n',
         '**Music**',
-        '📑 Queue · 🎵 Now Playing · ➕ Add Track · 🔍 Search · ♫ Mood\n',
+        '📑 Queue · 🎵 Now Playing · ➕ Add Track · 🔍 Search\n🎶 Mood & Discover\n',
         '**Controls**',
-        '🤍 Like · 🔉 Volume - · 🔊 Volume + · 🔁 Repeat · 🪄 AI Mix\n',
+        '🤍 Like · 🔉 Vol - · 🔊 Vol + (up to 200%) · 🪄 AI Mix\n',
         '**Library**',
         '❤️ Liked Songs · 🕒 History · 📑 Playlists · 🌐 Dashboard'
       ].join('\n')
@@ -144,30 +144,33 @@ function makePanel(guildId: string, taggedUserId?: string): {
     new ButtonBuilder().setCustomId(`music:stop:${guildId}`).setEmoji('✖️').setStyle(ButtonStyle.Danger)
   );
 
-  // Row 2: Music
+  // Row 2: Music (Line 1)
   const rowMusic = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`music:queue:${guildId}`).setEmoji('📑').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`music:nowplaying:${guildId}`).setEmoji('🎵').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`music:add:${guildId}`).setEmoji('➕').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`music:search:${guildId}`).setEmoji('🔍').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`music:mood:${guildId}`).setEmoji('♫').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`music:search:${guildId}`).setEmoji('🔍').setStyle(ButtonStyle.Secondary)
   );
 
-  // Row 3: Controls
+  // Row 3: Music (Line 2 - Mood & AI)
+  const rowMusicCont = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`music:mood:${guildId}`).setEmoji('🎶').setStyle(ButtonStyle.Secondary)
+  );
+
+  // Row 4: Controls
   const rowControls = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`music:like:${guildId}`).setEmoji('🤍').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`music:vol_down:${guildId}`).setEmoji('🔉').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`music:vol_up:${guildId}`).setEmoji('🔊').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`music:repeat:${guildId}`).setEmoji('🔁').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`music:ai_mix:${guildId}`).setEmoji('🪄').setStyle(ButtonStyle.Secondary)
   );
 
-  // Row 4: Library
+  // Row 5: Library
   const rowLibrary = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`music:library_favs:${guildId}`).setEmoji('❤️').setLabel('Liked').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`music:library_history:${guildId}`).setEmoji('🕒').setLabel('History').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`music:library_playlists:${guildId}`).setEmoji('📑').setLabel('Playlists').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`music:dashboard_link:${guildId}`).setEmoji('🌐').setLabel('Dashboard').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`music:library_favs:${guildId}`).setEmoji('❤️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:library_history:${guildId}`).setEmoji('🕒').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:library_playlists:${guildId}`).setEmoji('📑').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`music:dashboard_link:${guildId}`).setEmoji('🌐').setStyle(ButtonStyle.Secondary)
   );
 
   const result: {
@@ -176,7 +179,7 @@ function makePanel(guildId: string, taggedUserId?: string): {
     components: ActionRowBuilder<ButtonBuilder>[];
   } = {
     embeds: [embed],
-    components: [rowPlayback, rowMusic, rowControls, rowLibrary]
+    components: [rowPlayback, rowMusic, rowMusicCont, rowControls, rowLibrary]
   };
 
   if (taggedUserId) {
@@ -607,12 +610,17 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
     const { guild, voice, text } = getVoiceContext(interaction);
     await interaction.deferReply({ ephemeral: true });
     await connectToVoice(guild, voice, text, interaction.user.id);
-    await text.send(makePanel(guild.id, interaction.user.id)).catch(() => undefined);
-    await interaction.editReply({ content: `🎧 Joined **${voice.name}** and opened the music controller.` });
+    const panel = makePanel(guild.id, interaction.user.id);
+    await text.send(panel).catch(() => undefined);
+    await interaction.editReply({
+      content: `🎧 Joined **${voice.name}** and opened the music controller. Summoned by <@${interaction.user.id}>.`,
+      embeds: panel.embeds,
+      components: panel.components
+    });
     return;
   }
   if (interaction.commandName === 'controls') {
-    return void await interaction.reply({ ...makePanel(interaction.guild!.id, interaction.user.id) });
+    return void await interaction.reply({ ...makePanel(interaction.guild!.id, interaction.user.id), ephemeral: true });
   }
 
   if (interaction.commandName === 'playlist') return executePlaylist(interaction);
@@ -640,7 +648,12 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
       track = await resolveTrackMetadata(rawUrl, interaction.user.id, customTitle);
     }
     const result = await enqueueTrack(guild, voice, text, track);
-    await interaction.editReply(result.started ? `Now playing **${track.title}**.` : `Added **${track.title}** to the queue at position ${result.position}.`);
+    const panel = makePanel(guild.id, interaction.user.id);
+    await interaction.editReply({
+      content: result.started ? `Now playing **${track.title}**.` : `Added **${track.title}** to the queue at position ${result.position}.`,
+      embeds: panel.embeds,
+      components: panel.components
+    });
     return;
   }
 
@@ -944,7 +957,9 @@ async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<
 export function registerBotHandlers(client: Client): void {
   setOnTrackStart(async (guildId, track, textChannel) => {
     if (textChannel && 'send' in textChannel) {
-      await textChannel.send(makePanel(guildId, track.requestedBy)).catch(() => undefined);
+      await textChannel.send(makePanel(guildId, track.requestedBy)).catch((e) => {
+        log('warn', 'track_start_panel_send_failed', { guildId, error: e instanceof Error ? e.message : e });
+      });
     }
   });
 

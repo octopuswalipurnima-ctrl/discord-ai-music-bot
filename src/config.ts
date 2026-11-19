@@ -20,10 +20,10 @@ const schema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   AUDIO_ALLOWED_HOSTS: z.string().optional().default(''),
   MAX_QUEUE_SIZE: z.coerce.number().int().min(1).max(500).default(100),
-  DEFAULT_VOLUME: z.coerce.number().int().min(0).max(100).default(70),
+  DEFAULT_VOLUME: z.coerce.number().int().min(0).max(200).default(70),
   AI_API_BASE_URL: z.string().optional().default(''),
   AI_API_KEY: z.string().optional().default(''),
-  AI_MODEL: z.string().optional().default('gpt-4o-mini')
+  AI_MODEL: z.string().optional().default('openai/gpt-4o-mini')
 });
 
 const parsed = schema.safeParse(process.env);

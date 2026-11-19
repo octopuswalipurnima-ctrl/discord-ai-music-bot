@@ -122,8 +122,8 @@ export const commands = [
   new SlashCommandBuilder().setName('leave').setDescription('Moderator: disconnect the bot from voice'),
   new SlashCommandBuilder().setName('queue').setDescription('Show the current queue'),
   new SlashCommandBuilder().setName('nowplaying').setDescription('Show the music control panel'),
-  new SlashCommandBuilder().setName('volume').setDescription('Moderator: set playback volume')
-    .addIntegerOption((o) => o.setName('percent').setDescription('Volume from 0 to 100').setRequired(true).setMinValue(0).setMaxValue(100)),
+  new SlashCommandBuilder().setName('volume').setDescription('Moderator: set playback volume (up to 200%)')
+    .addIntegerOption((o) => o.setName('percent').setDescription('Volume from 0 to 200%').setRequired(true).setMinValue(0).setMaxValue(200)),
   new SlashCommandBuilder().setName('repeat').setDescription('Moderator: set repeat mode')
     .addStringOption((o) => o.setName('mode').setDescription('Repeat mode').setRequired(true)
       .addChoices({ name: 'Off', value: 'off' }, { name: 'Current track', value: 'track' }, { name: 'Queue', value: 'queue' })),

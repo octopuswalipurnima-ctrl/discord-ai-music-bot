@@ -129,46 +129,61 @@ export async function removeCatalogueTrack(guildId: string, trackId: number): Pr
   return (result.rowCount ?? 0) > 0;
 }
 
+const inMemoryDjMode = new Map<string, DjMode>();
+
 export async function setGuildDjMode(guildId: string, mode: DjMode, actorId: string): Promise<void> {
+  inMemoryDjMode.set(guildId, mode);
   let selectedMood: MoodName | null = null;
   let autoEnabled = false;
   if (mode === 'auto') autoEnabled = true;
   else if (mode !== 'off') selectedMood = mode;
-  await db.query(
-    `INSERT INTO guild_dj_settings (guild_id, mood, auto_enabled, updated_by, updated_at)
-     VALUES ($1,$2,$3,$4,NOW())
-     ON CONFLICT (guild_id) DO UPDATE SET mood = EXCLUDED.mood,
-       auto_enabled = EXCLUDED.auto_enabled, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
-    [guildId, selectedMood, autoEnabled, actorId]
-  );
-  await db.query(
-    `INSERT INTO server_audit_log (guild_id, actor_id, action, details)
-     VALUES ($1,$2,'dj_mode_changed',$3::jsonb)`,
-    [guildId, actorId, JSON.stringify({ mode })]
-  );
+  try {
+    await db.query(
+      `INSERT INTO guild_dj_settings (guild_id, mood, auto_enabled, updated_by, updated_at)
+       VALUES ($1,$2,$3,$4,NOW())
+       ON CONFLICT (guild_id) DO UPDATE SET mood = EXCLUDED.mood,
+         auto_enabled = EXCLUDED.auto_enabled, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [guildId, selectedMood, autoEnabled, actorId]
+    );
+    await db.query(
+      `INSERT INTO server_audit_log (guild_id, actor_id, action, details)
+       VALUES ($1,$2,'dj_mode_changed',$3::jsonb)`,
+      [guildId, actorId, JSON.stringify({ mode })]
+    );
+  } catch {
+    // Non-fatal when running in memory mode
+  }
 }
 
 export async function getGuildDjMode(guildId: string): Promise<DjMode> {
-  const result = await db.query<{ mood: string | null; auto_enabled: boolean }>(
-    'SELECT mood, auto_enabled FROM guild_dj_settings WHERE guild_id = $1', [guildId]
-  );
-  const row = result.rows[0];
-  if (!row) return 'off';
-  if (row.auto_enabled) return 'auto';
-  return row.mood && MOOD_NAMES.includes(row.mood as MoodName) ? row.mood as MoodName : 'off';
+  try {
+    const result = await db.query<{ mood: string | null; auto_enabled: boolean }>(
+      'SELECT mood, auto_enabled FROM guild_dj_settings WHERE guild_id = $1', [guildId]
+    );
+    const row = result.rows[0];
+    if (!row) return 'off';
+    if (row.auto_enabled) return 'auto';
+    return row.mood && MOOD_NAMES.includes(row.mood as MoodName) ? row.mood as MoodName : 'off';
+  } catch {
+    return inMemoryDjMode.get(guildId) ?? 'auto';
+  }
 }
 
 async function getRecentPlayedTracks(guildId: string, limit: number): Promise<CatalogueCandidate[]> {
-  const result = await db.query(
-    `SELECT t.id, t.title, t.artist, t.album, t.source_url, t.duration_seconds,
-            t.genre_tags, t.mood_tags, t.language, t.bpm, t.energy
-       FROM guild_track_history h
-       JOIN music_catalogue_tracks t ON t.id = h.catalogue_track_id
-      WHERE h.guild_id = $1 AND t.active = TRUE
-      ORDER BY h.played_at DESC LIMIT $2`,
-    [guildId, limit]
-  );
-  return result.rows.map((row) => toCandidate(row as Record<string, unknown>));
+  try {
+    const result = await db.query(
+      `SELECT t.id, t.title, t.artist, t.album, t.source_url, t.duration_seconds,
+              t.genre_tags, t.mood_tags, t.language, t.bpm, t.energy
+         FROM guild_track_history h
+         JOIN music_catalogue_tracks t ON t.id = h.catalogue_track_id
+        WHERE h.guild_id = $1 AND t.active = TRUE
+        ORDER BY h.played_at DESC LIMIT $2`,
+      [guildId, limit]
+    );
+    return result.rows.map((row) => toCandidate(row as Record<string, unknown>));
+  } catch {
+    return [];
+  }
 }
 
 export async function getEffectiveGuildMood(guildId: string): Promise<MoodName> {
@@ -181,11 +196,16 @@ export async function getEffectiveGuildMood(guildId: string): Promise<MoodName> 
 
 export async function getGuildDjStatus(guildId: string): Promise<GuildDjStatus> {
   const mode = await getGuildDjMode(guildId);
-  const [effectiveMood, countResult] = await Promise.all([
-    mode === 'off' ? Promise.resolve('balanced' as const) : getEffectiveGuildMood(guildId),
-    db.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM music_catalogue_tracks WHERE guild_id = $1 AND active = TRUE', [guildId])
-  ]);
-  return { mode, effectiveMood, catalogueCount: Number(countResult.rows[0]?.count ?? 0) };
+  try {
+    const [effectiveMood, countResult] = await Promise.all([
+      mode === 'off' ? Promise.resolve('balanced' as const) : getEffectiveGuildMood(guildId),
+      db.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM music_catalogue_tracks WHERE guild_id = $1 AND active = TRUE', [guildId])
+    ]);
+    return { mode, effectiveMood, catalogueCount: Number(countResult.rows[0]?.count ?? 0) };
+  } catch {
+    const effectiveMood = mode === 'off' ? 'balanced' as const : await getEffectiveGuildMood(guildId);
+    return { mode, effectiveMood, catalogueCount: 0 };
+  }
 }
 
 export async function getAiShuffleTracks(guildId: string, count: number, requestedBy: string): Promise<{ mood: MoodName | 'balanced'; tracks: Track[] }> {

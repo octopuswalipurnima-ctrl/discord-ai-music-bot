@@ -65,12 +65,22 @@ function toTrack(candidate: CatalogueCandidate, requestedBy: string): Track {
   };
 }
 
+interface InMemTasteEvent extends TasteEvent {
+  createdAt: Date;
+}
+const inMemoryConsent = new Map<string, boolean>();
+const inMemoryTasteEvents = new Map<string, InMemTasteEvent[]>();
+
 export async function isPersonalHistoryEnabled(guildId: string, userId: string): Promise<boolean> {
-  const result = await db.query<{ history_enabled: boolean }>(
-    'SELECT history_enabled FROM user_music_preferences WHERE guild_id = $1 AND user_id = $2',
-    [guildId, userId]
-  );
-  return result.rows[0]?.history_enabled === true;
+  try {
+    const result = await db.query<{ history_enabled: boolean }>(
+      'SELECT history_enabled FROM user_music_preferences WHERE guild_id = $1 AND user_id = $2',
+      [guildId, userId]
+    );
+    return result.rows[0]?.history_enabled === true;
+  } catch {
+    return inMemoryConsent.get(`${guildId}:${userId}`) ?? true;
+  }
 }
 
 async function lockPersonalProfile(connection: import('pg').PoolClient, guildId: string, userId: string): Promise<void> {
@@ -78,77 +88,105 @@ async function lockPersonalProfile(connection: import('pg').PoolClient, guildId:
 }
 
 export async function setPersonalHistoryConsent(guildId: string, userId: string, enabled: boolean): Promise<void> {
-  const connection = await db.connect();
+  inMemoryConsent.set(`${guildId}:${userId}`, enabled);
   try {
-    await connection.query('BEGIN');
-    await lockPersonalProfile(connection, guildId, userId);
-    await connection.query(
-      `INSERT INTO user_music_preferences (guild_id, user_id, history_enabled, consent_updated_at)
-       VALUES ($1,$2,$3,NOW())
-       ON CONFLICT (guild_id, user_id) DO UPDATE
-         SET history_enabled = EXCLUDED.history_enabled, consent_updated_at = NOW()`,
-      [guildId, userId, enabled]
-    );
-    await connection.query('COMMIT');
-  } catch (error) {
-    await connection.query('ROLLBACK').catch(() => undefined);
-    throw error;
-  } finally {
-    connection.release();
+    const connection = await db.connect();
+    try {
+      await connection.query('BEGIN');
+      await lockPersonalProfile(connection, guildId, userId);
+      await connection.query(
+        `INSERT INTO user_music_preferences (guild_id, user_id, history_enabled, consent_updated_at)
+         VALUES ($1,$2,$3,NOW())
+         ON CONFLICT (guild_id, user_id) DO UPDATE
+           SET history_enabled = EXCLUDED.history_enabled, consent_updated_at = NOW()`,
+        [guildId, userId, enabled]
+      );
+      await connection.query('COMMIT');
+    } catch (error) {
+      await connection.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch {
+    // In-memory fallback
   }
 }
 
 export async function forgetPersonalMusicData(guildId: string, userId: string): Promise<void> {
-  const connection = await db.connect();
+  inMemoryConsent.set(`${guildId}:${userId}`, false);
+  inMemoryTasteEvents.delete(`${guildId}:${userId}`);
   try {
-    await connection.query('BEGIN');
-    await lockPersonalProfile(connection, guildId, userId);
-    await connection.query('DELETE FROM user_track_events WHERE guild_id = $1 AND user_id = $2', [guildId, userId]);
-    await connection.query(
-      `INSERT INTO user_music_preferences (guild_id, user_id, history_enabled, consent_updated_at)
-       VALUES ($1,$2,FALSE,NOW())
-       ON CONFLICT (guild_id, user_id) DO UPDATE
-         SET history_enabled = FALSE, consent_updated_at = NOW()`,
-      [guildId, userId]
-    );
-    await connection.query('COMMIT');
-  } catch (error) {
-    await connection.query('ROLLBACK').catch(() => undefined);
-    throw error;
-  } finally {
-    connection.release();
+    const connection = await db.connect();
+    try {
+      await connection.query('BEGIN');
+      await lockPersonalProfile(connection, guildId, userId);
+      await connection.query('DELETE FROM user_track_events WHERE guild_id = $1 AND user_id = $2', [guildId, userId]);
+      await connection.query(
+        `INSERT INTO user_music_preferences (guild_id, user_id, history_enabled, consent_updated_at)
+         VALUES ($1,$2,FALSE,NOW())
+         ON CONFLICT (guild_id, user_id) DO UPDATE
+           SET history_enabled = FALSE, consent_updated_at = NOW()`,
+        [guildId, userId]
+      );
+      await connection.query('COMMIT');
+    } catch (error) {
+      await connection.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch {
+    // In-memory fallback
   }
 }
 
 async function insertUserTrackEvent(
   guildId: string, userId: string, track: Track, eventType: 'play' | 'like' | 'dislike'
 ): Promise<boolean> {
-  const connection = await db.connect();
+  const key = `${guildId}:${userId}`;
   try {
-    await connection.query('BEGIN');
-    await lockPersonalProfile(connection, guildId, userId);
-    const consent = await connection.query<{ history_enabled: boolean }>(
-      'SELECT history_enabled FROM user_music_preferences WHERE guild_id = $1 AND user_id = $2', [guildId, userId]
-    );
-    if (consent.rows[0]?.history_enabled !== true) {
-      await connection.query('ROLLBACK');
-      return false;
+    const connection = await db.connect();
+    try {
+      await connection.query('BEGIN');
+      await lockPersonalProfile(connection, guildId, userId);
+      const consent = await connection.query<{ history_enabled: boolean }>(
+        'SELECT history_enabled FROM user_music_preferences WHERE guild_id = $1 AND user_id = $2', [guildId, userId]
+      );
+      if (consent.rows[0]?.history_enabled !== true) {
+        await connection.query('ROLLBACK');
+        return false;
+      }
+      await connection.query(
+        `INSERT INTO user_track_events
+          (guild_id, user_id, catalogue_track_id, title, artist, genre_tags, mood_tags, language, bpm, energy, event_type)
+         VALUES ($1,$2,$3,$4,$5,$6::text[],$7::text[],$8,$9,$10,$11)`,
+        [guildId, userId, track.catalogueTrackId ?? null, track.title.slice(0, 200), track.artist?.slice(0, 120) ?? null,
+          track.genreTags ?? [], track.moodTags ?? [], track.language?.slice(0, 32) ?? null,
+          track.bpm ?? null, track.energy ?? null, eventType]
+      );
+      await connection.query('COMMIT');
+      return true;
+    } catch (error) {
+      await connection.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      connection.release();
     }
-    await connection.query(
-      `INSERT INTO user_track_events
-        (guild_id, user_id, catalogue_track_id, title, artist, genre_tags, mood_tags, language, bpm, energy, event_type)
-       VALUES ($1,$2,$3,$4,$5,$6::text[],$7::text[],$8,$9,$10,$11)`,
-      [guildId, userId, track.catalogueTrackId ?? null, track.title.slice(0, 200), track.artist?.slice(0, 120) ?? null,
-        track.genreTags ?? [], track.moodTags ?? [], track.language?.slice(0, 32) ?? null,
-        track.bpm ?? null, track.energy ?? null, eventType]
-    );
-    await connection.query('COMMIT');
+  } catch {
+    // In-memory fallback
+    const list = inMemoryTasteEvents.get(key) ?? [];
+    list.unshift({
+      eventType,
+      title: track.title,
+      artist: track.artist ?? null,
+      genreTags: track.genreTags ?? [],
+      moodTags: track.moodTags ?? [],
+      catalogueTrackId: track.catalogueTrackId ?? null,
+      createdAt: new Date()
+    });
+    inMemoryTasteEvents.set(key, list.slice(0, 500));
     return true;
-  } catch (error) {
-    await connection.query('ROLLBACK').catch(() => undefined);
-    throw error;
-  } finally {
-    connection.release();
   }
 }
 
@@ -165,66 +203,98 @@ export async function recordPersonalFeedback(
 }
 
 async function getTasteEvents(guildId: string, userId: string, limit = 500): Promise<TasteEvent[]> {
-  const result = await db.query<EventRow>(
-    `SELECT event_type, title, artist, genre_tags, mood_tags,
-            catalogue_track_id::text, created_at
-       FROM user_track_events
-      WHERE guild_id = $1 AND user_id = $2
-      ORDER BY created_at DESC LIMIT $3`,
-    [guildId, userId, Math.max(1, Math.min(1000, limit))]
-  );
-  return result.rows.map(eventFromRow);
+  try {
+    const result = await db.query<EventRow>(
+      `SELECT event_type, title, artist, genre_tags, mood_tags,
+              catalogue_track_id::text, created_at
+         FROM user_track_events
+        WHERE guild_id = $1 AND user_id = $2
+        ORDER BY created_at DESC LIMIT $3`,
+      [guildId, userId, Math.max(1, Math.min(1000, limit))]
+    );
+    return result.rows.map(eventFromRow);
+  } catch {
+    return (inMemoryTasteEvents.get(`${guildId}:${userId}`) ?? []).slice(0, limit);
+  }
 }
 
 export async function getPersonalTasteProfile(guildId: string, userId: string): Promise<TasteProfile> {
-  // Reading one's own retained profile remains allowed after opt-out; opt-out only stops new collection.
   return buildTasteProfile(await getTasteEvents(guildId, userId));
 }
 
 export async function getPersonalTasteOverview(guildId: string, userId: string): Promise<TasteOverview> {
   const historyEnabled = await isPersonalHistoryEnabled(guildId, userId);
-  const [profile, recentResult, countResult] = await Promise.all([
-    getPersonalTasteProfile(guildId, userId),
-    db.query<{ title: string; artist: string | null; created_at: Date | string }>(
-      `SELECT title, artist, created_at FROM user_track_events
-        WHERE guild_id = $1 AND user_id = $2 AND event_type = 'play'
-        ORDER BY created_at DESC LIMIT 10`, [guildId, userId]
-    ),
-    db.query<{ total_plays: string; likes: string; dislikes: string }>(
-      `SELECT COUNT(*) FILTER (WHERE event_type = 'play')::text AS total_plays,
-              COUNT(*) FILTER (WHERE event_type = 'like')::text AS likes,
-              COUNT(*) FILTER (WHERE event_type = 'dislike')::text AS dislikes
-         FROM user_track_events WHERE guild_id = $1 AND user_id = $2`, [guildId, userId]
-    )
-  ]);
-  const totals = countResult.rows[0];
-  return {
-    historyEnabled, totalPlays: Number(totals?.total_plays ?? 0), likes: Number(totals?.likes ?? 0), dislikes: Number(totals?.dislikes ?? 0),
-    topGenres: profile.topGenres, topArtists: profile.topArtists, topMoods: profile.topMoods,
-    recentTracks: recentResult.rows.map((row) => ({
-      title: row.title, artist: row.artist,
-      playedAt: new Date(row.created_at).toISOString()
-    }))
-  };
+  try {
+    const [profile, recentResult, countResult] = await Promise.all([
+      getPersonalTasteProfile(guildId, userId),
+      db.query<{ title: string; artist: string | null; created_at: Date | string }>(
+        `SELECT title, artist, created_at FROM user_track_events
+          WHERE guild_id = $1 AND user_id = $2 AND event_type = 'play'
+          ORDER BY created_at DESC LIMIT 10`, [guildId, userId]
+      ),
+      db.query<{ total_plays: string; likes: string; dislikes: string }>(
+        `SELECT COUNT(*) FILTER (WHERE event_type = 'play')::text AS total_plays,
+                COUNT(*) FILTER (WHERE event_type = 'like')::text AS likes,
+                COUNT(*) FILTER (WHERE event_type = 'dislike')::text AS dislikes
+           FROM user_track_events WHERE guild_id = $1 AND user_id = $2`, [guildId, userId]
+      )
+    ]);
+    const totals = countResult.rows[0];
+    return {
+      historyEnabled, totalPlays: Number(totals?.total_plays ?? 0), likes: Number(totals?.likes ?? 0), dislikes: Number(totals?.dislikes ?? 0),
+      topGenres: profile.topGenres, topArtists: profile.topArtists, topMoods: profile.topMoods,
+      recentTracks: recentResult.rows.map((row) => ({
+        title: row.title, artist: row.artist,
+        playedAt: new Date(row.created_at).toISOString()
+      }))
+    };
+  } catch {
+    const events = inMemoryTasteEvents.get(`${guildId}:${userId}`) ?? [];
+    const profile = buildTasteProfile(events);
+    const plays = events.filter(e => e.eventType === 'play');
+    const likes = events.filter(e => e.eventType === 'like');
+    const dislikes = events.filter(e => e.eventType === 'dislike');
+    return {
+      historyEnabled, totalPlays: plays.length, likes: likes.length, dislikes: dislikes.length,
+      topGenres: profile.topGenres, topArtists: profile.topArtists, topMoods: profile.topMoods,
+      recentTracks: plays.slice(0, 10).map(e => ({
+        title: e.title,
+        artist: e.artist ?? null,
+        playedAt: e.createdAt.toISOString()
+      }))
+    };
+  }
 }
 
 export async function getPersonalHistory(guildId: string, userId: string, limit = 10): Promise<Array<{ title: string; artist: string | null; playedAt: string }>> {
-  const result = await db.query<{ title: string; artist: string | null; created_at: Date | string }>(
-    `SELECT title, artist, created_at FROM user_track_events
-      WHERE guild_id = $1 AND user_id = $2 AND event_type = 'play'
-      ORDER BY created_at DESC LIMIT $3`,
-    [guildId, userId, Math.max(1, Math.min(20, limit))]
-  );
-  return result.rows.map((row) => ({ title: row.title, artist: row.artist, playedAt: new Date(row.created_at).toISOString() }));
+  try {
+    const result = await db.query<{ title: string; artist: string | null; created_at: Date | string }>(
+      `SELECT title, artist, created_at FROM user_track_events
+        WHERE guild_id = $1 AND user_id = $2 AND event_type = 'play'
+        ORDER BY created_at DESC LIMIT $3`,
+      [guildId, userId, Math.max(1, Math.min(20, limit))]
+    );
+    return result.rows.map((row) => ({ title: row.title, artist: row.artist, playedAt: new Date(row.created_at).toISOString() }));
+  } catch {
+    const events = inMemoryTasteEvents.get(`${guildId}:${userId}`) ?? [];
+    return events
+      .filter(e => e.eventType === 'play')
+      .slice(0, limit)
+      .map(e => ({ title: e.title, artist: e.artist ?? null, playedAt: e.createdAt.toISOString() }));
+  }
 }
 
 async function getActiveCatalogue(guildId: string): Promise<CatalogueCandidate[]> {
-  const result = await db.query(
-    `SELECT id, title, artist, album, source_url, duration_seconds, genre_tags, mood_tags, language, bpm, energy
-       FROM music_catalogue_tracks WHERE guild_id = $1 AND active = TRUE ORDER BY id ASC LIMIT 1000`,
-    [guildId]
-  );
-  return result.rows.map((row) => toCandidate(row as Record<string, unknown>));
+  try {
+    const result = await db.query(
+      `SELECT id, title, artist, album, source_url, duration_seconds, genre_tags, mood_tags, language, bpm, energy
+         FROM music_catalogue_tracks WHERE guild_id = $1 AND active = TRUE ORDER BY id ASC LIMIT 1000`,
+      [guildId]
+    );
+    return result.rows.map((row) => toCandidate(row as Record<string, unknown>));
+  } catch {
+    return [];
+  }
 }
 
 export async function getPersonalRecommendations(

@@ -553,8 +553,8 @@ route.post('/api/guilds/:guildId/action', isLoggedIn, async (req, res) => {
     case 'leave': ok = hasSession(guild.id); if (ok) destroySession(guild.id); break;
     case 'clear-queue': ok = clearUpcomingQueue(guild.id) !== null; break;
     case 'volume':
-      if (!Number.isInteger(req.body?.volume) || req.body.volume < 0 || req.body.volume > 100) {
-        return res.status(400).json({ error: 'Volume must be from 0 to 100.' });
+      if (!Number.isInteger(req.body?.volume) || req.body.volume < 0 || req.body.volume > 200) {
+        return res.status(400).json({ error: 'Volume must be from 0 to 200.' });
       }
       ok = setVolume(guild.id, req.body.volume);
       break;
@@ -1015,8 +1015,8 @@ export const DASHBOARD_HTML = `<!doctype html>
             <!-- Volume & Repeat -->
             <div class="slider-row">
               <span style="font-size: 13px; color: var(--text-muted);">🔊 Volume</span>
-              <input type="range" class="slider" id="volume-slider" min="0" max="100" value="70">
-              <span id="volume-display" style="font-size: 13px; font-weight: 700; width: 38px;">70%</span>
+              <input type="range" class="slider" id="volume-slider" min="0" max="200" value="70">
+              <span id="volume-display" style="font-size: 13px; font-weight: 700; width: 48px;">70%</span>
             </div>
 
             <div style="display: flex; align-items: center; gap: 8px; margin-top: 16px;">
