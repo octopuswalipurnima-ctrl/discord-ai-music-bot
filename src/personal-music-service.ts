@@ -2,6 +2,7 @@ import { db } from './db.js';
 import { config } from './config.js';
 import { log } from './logger.js';
 import type { Track } from './audio-source.js';
+import { generateAiTracksWithOpenRouter } from './dj-service.js';
 import { MOOD_NAMES, type CatalogueCandidate, type MoodName } from './dj-types.js';
 import {
   buildTasteProfile, parseMusicRequestLocally, recommendForTaste,
@@ -300,14 +301,27 @@ async function getActiveCatalogue(guildId: string): Promise<CatalogueCandidate[]
 export async function getPersonalRecommendations(
   guildId: string, userId: string, count: number
 ): Promise<{ tracks: Track[]; profile: TasteProfile }> {
-  if (!await isPersonalHistoryEnabled(guildId, userId)) {
-    throw new Error('Turn on personal history with `/taste opt-in` before using `/for-me`. You can still view or delete any existing history.');
+  let profile = buildTasteProfile([]);
+  try {
+    profile = await getPersonalTasteProfile(guildId, userId);
+  } catch {}
+
+  let candidates: CatalogueCandidate[] = [];
+  try {
+    candidates = await getActiveCatalogue(guildId);
+  } catch {}
+
+  if (candidates.length > 0) {
+    const tracks = recommendForTaste(candidates, profile, count).map((candidate) => toTrack(candidate, userId));
+    if (tracks.length > 0) return { tracks, profile };
   }
-  const profile = await getPersonalTasteProfile(guildId, userId);
-  const candidates = await getActiveCatalogue(guildId);
-  if (!candidates.length) throw new Error('This server catalogue is empty. A moderator must add approved streams with `/catalog add`.');
-  const tracks = recommendForTaste(candidates, profile, count).map((candidate) => toTrack(candidate, userId));
-  return { tracks, profile };
+
+  // Fallback to OpenRouter AI generation
+  const genres = profile.topGenres.length ? profile.topGenres.join(', ') : 'popular hits';
+  const artists = profile.topArtists.length ? profile.topArtists.join(', ') : '';
+  const prompt = `songs matching music taste (genres: ${genres}${artists ? `, artists: ${artists}` : ''})`;
+  const aiTracks = await generateAiTracksWithOpenRouter(prompt, count, userId);
+  return { tracks: aiTracks, profile };
 }
 
 function strings(value: unknown, max = 8): string[] {
@@ -373,19 +387,28 @@ export async function getAssistantRecommendations(
   const cleanRequest = request.trim().slice(0, 300);
   if (cleanRequest.length < 3) throw new Error('Describe the kind of music you want in at least three characters.');
   const intent = await parseMusicRequest(cleanRequest);
-  const enabled = await isPersonalHistoryEnabled(guildId, userId);
-  const profile = enabled ? await getPersonalTasteProfile(guildId, userId) : buildTasteProfile([]);
-  const candidates = await getActiveCatalogue(guildId);
-  if (!candidates.length) throw new Error('This server catalogue is empty. Ask a moderator to add approved tracks with `/catalog add`.');
-  const hasConstraint = Boolean(intent.mood || intent.genres.length || intent.language || intent.energy);
-  const keywordsMatch = intent.keywords.length === 0 || candidates.some((candidate) => {
-    const searchable = `${candidate.title} ${candidate.artist ?? ''} ${candidate.album ?? ''}`.toLowerCase();
-    return intent.keywords.some((keyword) => searchable.includes(keyword));
-  });
-  if (intent.keywords.length && !hasConstraint && !keywordsMatch) {
-    throw new Error('I could not find that artist or track in this server catalogue. Try a mood or genre request, or ask a moderator to add the track.');
+  let enabled = false;
+  try {
+    enabled = await isPersonalHistoryEnabled(guildId, userId);
+  } catch {}
+  let profile = buildTasteProfile([]);
+  try {
+    if (enabled) profile = await getPersonalTasteProfile(guildId, userId);
+  } catch {}
+
+  let candidates: CatalogueCandidate[] = [];
+  try {
+    candidates = await getActiveCatalogue(guildId);
+  } catch {}
+
+  if (candidates.length > 0) {
+    const selected = recommendForTaste(candidates, profile, count, intent);
+    if (selected.length > 0) {
+      return { tracks: selected.map((candidate) => toTrack(candidate, userId)), intent, personalised: enabled };
+    }
   }
-  const selected = recommendForTaste(candidates, profile, count, intent);
-  if (!selected.length) throw new Error('I could not find a suitable track in this server catalogue. Try another description.');
-  return { tracks: selected.map((candidate) => toTrack(candidate, userId)), intent, personalised: enabled };
+
+  // Fallback: Generate real AI tracks using OpenRouter directly from the user's request!
+  const aiTracks = await generateAiTracksWithOpenRouter(cleanRequest, count, userId);
+  return { tracks: aiTracks, intent, personalised: enabled };
 }

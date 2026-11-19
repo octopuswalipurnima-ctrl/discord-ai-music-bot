@@ -19,7 +19,7 @@ import {
   type VoiceBasedChannel
 } from 'discord.js';
 import { config } from './config.js';
-import { displayTitleFromUrl, resolveTrackMetadata, validateConfiguredAudioUrl, type Track } from './audio-source.js';
+import { displayTitleFromUrl, resolvePlayableTracks, resolveTrackMetadata, validateConfiguredAudioUrl, type Track } from './audio-source.js';
 import {
   adjustVolume, clearUpcomingQueue, connectToVoice, cycleRepeatMode, destroySession, enqueueTrack,
   getSnapshot, pausePlayback, replayTrack, resumePlayback, setOnTrackStart, setRepeatMode,
@@ -429,8 +429,13 @@ async function executeAiShuffle(interaction: ChatInputCommandInteraction): Promi
     }
   }
   if (!added) throw new Error('No tracks could be added. Check the approved audio streams in the catalogue.');
-  await interaction.editReply(`AI DJ selected **${added}** tracks for **${result.mood}** mode. It balanced mood tags, genre, tempo, energy and recent-play variety.`);
-  if (firstStarted) await text.send({ ...makePanel(guild.id) }).catch(() => undefined);
+  const panel = makePanel(guild.id, interaction.user.id);
+  await interaction.editReply({
+    content: `AI DJ selected **${added}** tracks for **${result.mood}** mode. It balanced mood tags, genre, tempo, energy and recent-play variety.`,
+    embeds: panel.embeds,
+    components: panel.components
+  });
+  if (firstStarted) await text.send(panel).catch(() => undefined);
 }
 
 async function executeTaste(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -505,8 +510,13 @@ async function executeForMe(interaction: ChatInputCommandInteraction): Promise<v
       break;
     }
   }
-  await interaction.editReply(`**Picked for your taste**\n${list}\n\nAdded **${added}** tracks. Based on your opt-in history and feedback.`);
-  if (firstStarted) await text.send({ ...makePanel(guild.id) }).catch(() => undefined);
+  const forMePanel = makePanel(guild.id, interaction.user.id);
+  await interaction.editReply({
+    content: `**Picked for your taste**\n${list}\n\nAdded **${added}** tracks. Based on your opt-in history and feedback.`,
+    embeds: forMePanel.embeds,
+    components: forMePanel.components
+  });
+  if (firstStarted) await text.send(forMePanel).catch(() => undefined);
 }
 
 async function executeAskMusic(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -535,8 +545,13 @@ async function executeAskMusic(interaction: ChatInputCommandInteraction): Promis
     }
   }
   const personal = result.personalised ? ' Your private taste profile was also used.' : ' Turn on `/taste opt-in` to personalise future requests.';
-  await interaction.editReply(`**Music assistant**\nI understood: ${interpretation}.${personal}\nQueued **${added}** tracks from this server's approved catalogue.`);
-  if (firstStarted) await text.send({ ...makePanel(guild.id) }).catch(() => undefined);
+  const askPanel = makePanel(guild.id, interaction.user.id);
+  await interaction.editReply({
+    content: `**Music assistant**\nI understood: ${interpretation}.${personal}\nQueued **${added}** tracks.`,
+    embeds: askPanel.embeds,
+    components: askPanel.components
+  });
+  if (firstStarted) await text.send(askPanel).catch(() => undefined);
 }
 
 async function executeCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -637,20 +652,42 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
     const catalogueId = interaction.options.getInteger('catalogue_id');
     if (Boolean(url) === (catalogueId !== null)) throw new Error('Provide exactly one of `url` or `catalogue_id`.');
     await interaction.deferReply({ ephemeral: true });
-    let track: Track;
+    let tracks: Track[] = [];
     if (catalogueId !== null) {
       const catalogTrack = await getCatalogueTrack(guild.id, catalogueId);
       if (!catalogTrack) throw new Error('That track ID is not active in this server catalogue. Use `/catalog search`.');
-      track = { ...catalogTrack, requestedBy: interaction.user.id };
+      tracks = [{ ...catalogTrack, requestedBy: interaction.user.id }];
     } else {
       const rawUrl = url!;
       const customTitle = interaction.options.getString('title') ?? undefined;
-      track = await resolveTrackMetadata(rawUrl, interaction.user.id, customTitle);
+      tracks = await resolvePlayableTracks(rawUrl, interaction.user.id, customTitle);
     }
-    const result = await enqueueTrack(guild, voice, text, track);
+    if (!tracks.length) throw new Error('No playable tracks could be found.');
+
+    const firstTrack = tracks[0]!;
+    let addedCount = 0;
+    let firstResult: { started: boolean; position: number } | null = null;
+    for (const t of tracks) {
+      try {
+        const res = await enqueueTrack(guild, voice, text, t);
+        if (!firstResult) firstResult = res;
+        addedCount++;
+      } catch (err) {
+        if (!addedCount) throw err;
+        break;
+      }
+    }
+
     const panel = makePanel(guild.id, interaction.user.id);
+    let replyMsg = '';
+    if (tracks.length > 1) {
+      replyMsg = `🎶 Loaded playlist with **${addedCount}** tracks! Now playing **${firstTrack.title}**.`;
+    } else {
+      replyMsg = firstResult?.started ? `Now playing **${firstTrack.title}**.` : `Added **${firstTrack.title}** to the queue at position ${firstResult?.position}.`;
+    }
+
     await interaction.editReply({
-      content: result.started ? `Now playing **${track.title}**.` : `Added **${track.title}** to the queue at position ${result.position}.`,
+      content: replyMsg,
       embeds: panel.embeds,
       components: panel.components
     });
@@ -887,15 +924,21 @@ async function executeButton(interaction: ButtonInteraction): Promise<void> {
     return void await interaction.update(makePanel(guildId, interaction.user.id));
   }
   if (action === 'ai_mix') {
+    await interaction.deferReply({ ephemeral: true });
     const result = await getAiShuffleTracks(guildId, 3, interaction.user.id);
     const tracks = result.tracks;
-    if (!tracks.length) throw new Error('No catalogue tracks available for AI mix.');
+    if (!tracks.length) throw new Error('No tracks available for AI mix.');
     const { guild, voice, text } = getVoiceContext(interaction);
     for (const t of tracks) {
       await enqueueTrack(guild, voice, text, { ...t, requestedBy: interaction.user.id });
     }
-    await interaction.reply({ content: `🪄 Added **${tracks.length}** AI mood-matched tracks to the queue!`, ephemeral: true });
-    return void await text.send(makePanel(guildId, interaction.user.id)).catch(() => undefined);
+    const panel = makePanel(guildId, interaction.user.id);
+    await interaction.editReply({
+      content: `🪄 Added **${tracks.length}** AI mood-matched tracks (**${result.mood}**) to the queue!`,
+      embeds: panel.embeds,
+      components: panel.components
+    });
+    return void await text.send(panel).catch(() => undefined);
   }
 
   throw new Error('Unknown button action.');
@@ -909,47 +952,50 @@ async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<
   if (prefix === 'music_modal_add') {
     const input = interaction.fields.getTextInputValue('url_or_title');
     const { guild, voice, text } = getVoiceContext(interaction as any);
-    let track: Track;
-    if (input.startsWith('http://') || input.startsWith('https://')) {
-      track = await resolveTrackMetadata(input, interaction.user.id);
-    } else {
-      const results = await searchCatalogue(guildId, input);
-      if (results.length > 0 && results[0]) {
-        const match = results[0];
-        track = {
-          title: match.title,
-          url: match.url,
-          artist: match.artist ?? undefined,
-          catalogueTrackId: match.id,
-          requestedBy: interaction.user.id,
-          durationSeconds: match.durationSeconds ?? undefined,
-          bpm: match.bpm ?? undefined,
-          energy: match.energy ?? undefined,
-          genreTags: match.genreTags,
-          moodTags: match.moodTags
-        };
-      } else {
-        throw new Error(`Could not find "${input}" in the server catalogue. Please provide a direct HTTPS audio URL.`);
+    await interaction.deferReply({ ephemeral: true });
+    const tracks = await resolvePlayableTracks(input, interaction.user.id);
+    if (!tracks.length) throw new Error(`Could not find any playable audio for "${input}".`);
+
+    const firstTrack = tracks[0]!;
+    let addedCount = 0;
+    let firstResult: { started: boolean; position: number } | null = null;
+    for (const t of tracks) {
+      try {
+        const res = await enqueueTrack(guild, voice, text, t);
+        if (!firstResult) firstResult = res;
+        addedCount++;
+      } catch (err) {
+        if (!addedCount) throw err;
+        break;
       }
     }
-    const result = await enqueueTrack(guild, voice, text, track);
-    await interaction.reply({
-      content: result.started ? `Now playing **${track.title}**.` : `Added **${track.title}** to the queue at position ${result.position}.`,
-      ephemeral: true
+
+    const panel = makePanel(guildId, interaction.user.id);
+    let replyMsg = '';
+    if (tracks.length > 1) {
+      replyMsg = `🎶 Loaded playlist with **${addedCount}** tracks! Now playing **${firstTrack.title}**.`;
+    } else {
+      replyMsg = firstResult?.started ? `Now playing **${firstTrack.title}**.` : `Added **${firstTrack.title}** to the queue at position ${firstResult?.position}.`;
+    }
+
+    await interaction.editReply({
+      content: replyMsg,
+      embeds: panel.embeds,
+      components: panel.components
     });
     return;
   }
 
   if (prefix === 'music_modal_search') {
     const query = interaction.fields.getTextInputValue('query');
+    await interaction.deferReply({ ephemeral: true });
     const results = await searchCatalogue(guildId, query);
     if (!results.length) {
-      return void await interaction.reply({ content: `No tracks found matching "${query}".`, ephemeral: true });
+      return void await interaction.editReply({ content: `No tracks found matching "${query}".` });
     }
-    const lines = results.slice(0, 5).map(t => `**#${t.id}** · ${t.title}${t.artist ? ` — ${t.artist}` : ''}`);
-    return void await interaction.reply({
-      content: `**Search Results for "${query}"**\n${lines.join('\n')}\n\nPlay any result with \`/play catalogue_id:<ID>\`.`,
-      ephemeral: true
+    const lines = results.slice(0, 5).map(t => `**•** [${t.title}${t.artist ? ` — ${t.artist}` : ''}](${t.url})`);
+    return void await interaction.editReply({
+      content: `**Search Results for "${query}"**\n${lines.join('\n')}\n\nPlay any result with \`/play url:<link>\` or click Add Track ➕.`
     });
   }
 }
