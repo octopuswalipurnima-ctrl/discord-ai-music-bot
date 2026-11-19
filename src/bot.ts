@@ -23,8 +23,8 @@ import { config } from './config.js';
 import { displayTitleFromUrl, resolvePlayableTracks, resolveTrackMetadata, validateConfiguredAudioUrl, type Track } from './audio-source.js';
 import {
   adjustVolume, clearUpcomingQueue, connectToVoice, cycleRepeatMode, destroySession, enqueueTrack,
-  getSessionTextChannel, getSnapshot, isAutoPausedByEmptyVc, pausePlayback, replayTrack,
-  resumePlayback, setAutoPausedByEmptyVc, setOnTrackStart, setRepeatMode,
+  getLastPlayedTrack, getSessionTextChannel, getSnapshot, isAutoPausedByEmptyVc, pausePlayback, replayTrack,
+  resumePlayback, setAutoPausedByEmptyVc, setOnQueueEmpty, setOnTrackStart, setRepeatMode,
   setVolume, shuffleQueue, skipPlayback, stopPlayback
 } from './player.js';
 import {
@@ -32,7 +32,7 @@ import {
   listPlaylists, removePlaylistTrack, renamePlaylist, revokePlaylistEntitlement
 } from './playlist-service.js';
 import { getServerSettings, recordServerAudit, setModeratorRole } from './server-settings-service.js';
-import { addCatalogueTrack, getAiShuffleTracks, getCatalogueTrack, getGuildDjStatus, removeCatalogueTrack, searchCatalogue, setGuildDjMode, MOOD_NAMES } from './dj-service.js';
+import { addCatalogueTrack, generateAiTracksWithOpenRouter, getAiShuffleTracks, getCatalogueTrack, getGuildDjStatus, removeCatalogueTrack, searchCatalogue, setGuildDjMode, MOOD_NAMES } from './dj-service.js';
 import type { MoodName } from './dj-types.js';
 import { enforceCommandRateLimit, consumeRateLimit } from './rate-limit.js';
 import { incrementMetric } from './metrics.js';
@@ -100,6 +100,7 @@ function getVoiceContext(interaction: ChatInputCommandInteraction | ButtonIntera
 }
 
 const lastNowPlayingMessage = new Map<string, Message>();
+const lastQueuePromptMessage = new Map<string, Message>();
 
 function makeNowPlayingMessage(guildId: string, track: Track): {
   embeds: [EmbedBuilder];
@@ -716,34 +717,21 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
       }
     }
 
+    if (firstResult?.started && tracks.length === 1) {
+      await interaction.deleteReply().catch(() => undefined);
+      return;
+    }
+
     let replyMsg = '';
     if (tracks.length > 1) {
       replyMsg = `🎶 Loaded playlist with **${addedCount}** tracks! Now playing **${firstTrack.title}**.`;
     } else {
-      replyMsg = firstResult?.started ? `Now playing **${firstTrack.title}**.` : `Added **${firstTrack.title}** to the queue at position ${firstResult?.position}.`;
+      replyMsg = `📑 Added **${firstTrack.title}** to the queue at position #${firstResult?.position ?? 1}.`;
     }
-
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`music:open_controls:${guild.id}`)
-        .setLabel('Controls')
-        .setEmoji('🎛️')
-        .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId(`music:np_add_playlist:${guild.id}`)
-        .setLabel('Add to Playlist')
-        .setEmoji('➕')
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(`music:like:${guild.id}`)
-        .setLabel('Like')
-        .setEmoji('❤️')
-        .setStyle(ButtonStyle.Secondary)
-    );
 
     await interaction.editReply({
       content: replyMsg,
-      components: [row]
+      components: []
     });
     return;
   }
@@ -848,6 +836,60 @@ async function executeButton(interaction: ButtonInteraction): Promise<void> {
         { name: 'Genres', value: current.genreTags?.join(', ') || 'None', inline: true }
       );
     return void await interaction.reply({ embeds: [embed], ephemeral: true });
+  }
+
+  if (action === 'ai_takeover') {
+    assertInBotVoiceChannel(interaction);
+    await interaction.deferReply({ ephemeral: true });
+
+    const lastTrack = getLastPlayedTrack(guildId);
+    const lastTitle = lastTrack?.title ?? 'vibey music';
+    const lastArtist = lastTrack?.artist ? ` by ${lastTrack.artist}` : '';
+    const vibePrompt = `songs with the same vibe, mood, genre, and tempo as "${lastTitle}"${lastArtist}`;
+
+    let aiTracks: Track[] = [];
+    try {
+      aiTracks = await generateAiTracksWithOpenRouter(vibePrompt, 4, interaction.user.id);
+    } catch (err) {
+      log('warn', 'ai_takeover_generation_failed', { error: err });
+    }
+
+    if (!aiTracks.length) {
+      return void await interaction.editReply({
+        content: `❌ Could not find AI recommendations matching the vibe right now. Use </play:0> to choose songs!`
+      });
+    }
+
+    const { guild, voice, text } = getVoiceContext(interaction);
+    for (const t of aiTracks) {
+      await enqueueTrack(guild, voice, text, { ...t, requestedBy: interaction.user.id });
+    }
+
+    const promptMsg = lastQueuePromptMessage.get(guildId);
+    if (promptMsg) {
+      promptMsg.delete().catch(() => undefined);
+      lastQueuePromptMessage.delete(guildId);
+    }
+
+    return void await interaction.editReply({
+      content: `🪄 **AI DJ has taken over!** Queued **${aiTracks.length}** songs matching the vibe of **${lastTitle}**:\n` +
+        aiTracks.map((t, idx) => `**${idx + 1}.** ${t.title}${t.artist ? ` — *${t.artist}*` : ''}`).join('\n')
+    });
+  }
+
+  if (action === 'manual_play') {
+    assertInBotVoiceChannel(interaction);
+    const modal = new ModalBuilder()
+      .setCustomId(`music_modal_add:${guildId}`)
+      .setTitle('Add Song to Queue');
+    const input = new TextInputBuilder()
+      .setCustomId('url_or_title')
+      .setLabel('Audio URL or Title')
+      .setPlaceholder('https://... or Song Name')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+    return void await interaction.showModal(modal);
   }
 
   if (action === 'np_add_playlist') {
@@ -1056,34 +1098,21 @@ async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<
       }
     }
 
+    if (firstResult?.started && tracks.length === 1) {
+      await interaction.deleteReply().catch(() => undefined);
+      return;
+    }
+
     let replyMsg = '';
     if (tracks.length > 1) {
       replyMsg = `🎶 Loaded playlist with **${addedCount}** tracks! Now playing **${firstTrack.title}**.`;
     } else {
-      replyMsg = firstResult?.started ? `Now playing **${firstTrack.title}**.` : `Added **${firstTrack.title}** to the queue at position ${firstResult?.position}.`;
+      replyMsg = `📑 Added **${firstTrack.title}** to the queue at position #${firstResult?.position ?? 1}.`;
     }
-
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`music:open_controls:${guildId}`)
-        .setLabel('Controls')
-        .setEmoji('🎛️')
-        .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId(`music:np_add_playlist:${guildId}`)
-        .setLabel('Add to Playlist')
-        .setEmoji('➕')
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(`music:like:${guildId}`)
-        .setLabel('Like')
-        .setEmoji('❤️')
-        .setStyle(ButtonStyle.Secondary)
-    );
 
     await interaction.editReply({
       content: replyMsg,
-      components: [row]
+      components: []
     });
     return;
   }
@@ -1129,6 +1158,11 @@ async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<
 export function registerBotHandlers(client: Client): void {
   setOnTrackStart(async (guildId, track, textChannel) => {
     if (textChannel && 'send' in textChannel) {
+      const prevPrompt = lastQueuePromptMessage.get(guildId);
+      if (prevPrompt) {
+        prevPrompt.delete().catch(() => undefined);
+        lastQueuePromptMessage.delete(guildId);
+      }
       const prevMsg = lastNowPlayingMessage.get(guildId);
       if (prevMsg) {
         prevMsg.delete().catch(() => undefined);
@@ -1139,6 +1173,56 @@ export function registerBotHandlers(client: Client): void {
       });
       if (msg) lastNowPlayingMessage.set(guildId, msg);
     }
+  });
+
+  setOnQueueEmpty(async (guildId, lastTrack, textChannel) => {
+    if (!textChannel || !('send' in textChannel)) return;
+
+    // Check if there are human users in the voice channel
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) return;
+    const botMember = guild.members.me ?? await guild.members.fetchMe().catch(() => null);
+    const voiceChannel = botMember?.voice.channel;
+    if (!voiceChannel) return;
+
+    const humanCount = voiceChannel.members.filter((m) => !m.user.bot).size;
+    if (humanCount === 0) return; // Nobody in voice channel
+
+    // Clean up previous prompt if any
+    const prev = lastQueuePromptMessage.get(guildId);
+    if (prev) {
+      prev.delete().catch(() => undefined);
+      lastQueuePromptMessage.delete(guildId);
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(0xec4899)
+      .setTitle('🎶 Queue Finished — Keep the Music Going?')
+      .setDescription(
+        `The queue is empty, but you're still chilling in voice!\n\n` +
+        `Would you like the **AI DJ** to take over and keep the vibe flowing, or would you like to play songs yourself?\n\n` +
+        (lastTrack ? `✨ *AI will match the vibe of **${lastTrack.title}**${lastTrack.artist ? ` by **${lastTrack.artist}**` : ''}.*` : '')
+      )
+      .setFooter({ text: 'Choose below • Available to voice channel participants' });
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`music:ai_takeover:${guildId}`)
+        .setLabel('Let AI Take Over')
+        .setEmoji('🪄')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`music:manual_play:${guildId}`)
+        .setLabel("I'll Play Myself")
+        .setEmoji('🎧')
+        .setStyle(ButtonStyle.Secondary)
+    );
+
+    const promptMsg = await textChannel.send({ embeds: [embed], components: [row] }).catch((e) => {
+      log('warn', 'queue_empty_prompt_send_failed', { guildId, error: e instanceof Error ? e.message : e });
+      return null;
+    });
+    if (promptMsg) lastQueuePromptMessage.set(guildId, promptMsg);
   });
 
   client.on(Events.InteractionCreate, async (interaction) => {

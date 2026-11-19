@@ -4,7 +4,9 @@ import {
   isAutoPausedByEmptyVc,
   setAutoPausedByEmptyVc,
   hasSession,
-  getSnapshot
+  getSnapshot,
+  getLastPlayedTrack,
+  setOnQueueEmpty
 } from '../dist/player.js';
 
 test('auto-pause by empty VC flags are strictly scoped per guild', () => {
@@ -24,4 +26,11 @@ test('per-server session isolation ensures non-existent sessions do not leak dat
   assert.equal(hasSession('server-beta'), false);
   assert.equal(getSnapshot('server-alpha'), null);
   assert.equal(getSnapshot('server-beta'), null);
+  assert.equal(getLastPlayedTrack('server-alpha'), null);
+});
+
+test('setOnQueueEmpty handler registration is supported', () => {
+  let called = false;
+  setOnQueueEmpty(() => { called = true; });
+  assert.equal(called, false);
 });

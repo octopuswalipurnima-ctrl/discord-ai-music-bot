@@ -43,6 +43,7 @@ interface GuildPlayer {
   voiceChannelId?: string;
   voiceChannelName?: string;
   autoPausedByEmptyVc?: boolean;
+  lastPlayedTrack?: Track | null;
 }
 
 export interface PlayerSnapshot {
@@ -94,6 +95,12 @@ export function setOnTrackStart(handler: OnTrackStartHandler): void {
   onTrackStartHandler = handler;
 }
 
+export type OnQueueEmptyHandler = (guildId: string, lastTrack: Track | null, textChannel: GuildTextBasedChannel | null) => void;
+let onQueueEmptyHandler: OnQueueEmptyHandler | null = null;
+export function setOnQueueEmpty(handler: OnQueueEmptyHandler): void {
+  onQueueEmptyHandler = handler;
+}
+
 function killCurrentProcess(state: GuildPlayer): void {
   if (state.currentProcess && !state.currentProcess.killed) state.currentProcess.kill('SIGKILL');
   state.currentProcess = null;
@@ -102,7 +109,17 @@ function killCurrentProcess(state: GuildPlayer): void {
 async function startNext(state: GuildPlayer): Promise<void> {
   if (state.starting || state.current || state.stopRequested) return;
   const next = state.queue.shift();
-  if (!next) return;
+  if (!next) {
+    if (!state.stopRequested && onQueueEmptyHandler) {
+      try {
+        onQueueEmptyHandler(state.guildId, state.lastPlayedTrack ?? null, state.textChannel);
+      } catch (handlerError) {
+        log('warn', 'on_queue_empty_handler_failed', { guildId: state.guildId, error: handlerError });
+      }
+    }
+    return;
+  }
+  state.lastPlayedTrack = next;
   // Claim the slot synchronously so a concurrent caller (Idle event vs /play) cannot start a second track.
   state.starting = true;
   const epoch = state.epoch;
@@ -177,7 +194,8 @@ function createSession(guild: Guild, voiceChannel: VoiceBasedChannel, textChanne
     summonedBy,
     voiceChannelId: voiceChannel.id,
     voiceChannelName: voiceChannel.name,
-    autoPausedByEmptyVc: false
+    autoPausedByEmptyVc: false,
+    lastPlayedTrack: null
   };
 
   state.leaseRenewal = setInterval(() => {
@@ -198,6 +216,7 @@ function createSession(guild: Guild, voiceChannel: VoiceBasedChannel, textChanne
 
   player.on(AudioPlayerStatus.Idle, () => {
     const finished = state.current;
+    if (finished) state.lastPlayedTrack = finished;
     killCurrentProcess(state);
     state.current = null;
     state.currentResource = null;
@@ -422,6 +441,10 @@ export function isAutoPausedByEmptyVc(guildId: string): boolean {
 export function setAutoPausedByEmptyVc(guildId: string, value: boolean): void {
   const state = sessions.get(guildId);
   if (state) state.autoPausedByEmptyVc = value;
+}
+
+export function getLastPlayedTrack(guildId: string): Track | null {
+  return sessions.get(guildId)?.lastPlayedTrack ?? null;
 }
 
 export function getSessionTextChannel(guildId: string): GuildTextBasedChannel | null {
