@@ -114,14 +114,24 @@ function makeNowPlayingMessage(guildId: string, track: Track): {
         ? `Artist: **${track.artist}**${duration ? ` · ⏱️ ${duration}` : ''}`
         : (duration ? `⏱️ Duration: **${duration}**` : 'Playing audio stream')
     )
-    .setFooter({ text: 'Voice Channel Controls • Click Controls below to open player settings' });
+    .setFooter({ text: 'Voice Channel Controls • Use the buttons below' });
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`music:open_controls:${guildId}`)
       .setLabel('Controls')
       .setEmoji('🎛️')
-      .setStyle(ButtonStyle.Primary)
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`music:np_add_playlist:${guildId}`)
+      .setLabel('Add to Playlist')
+      .setEmoji('➕')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`music:like:${guildId}`)
+      .setLabel('Like')
+      .setEmoji('❤️')
+      .setStyle(ButtonStyle.Secondary)
   );
 
   return {
@@ -648,11 +658,16 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
     const { guild, voice, text } = getVoiceContext(interaction);
     await interaction.deferReply({ ephemeral: true });
     await connectToVoice(guild, voice, text, interaction.user.id);
-    const panel = makePanel(guild.id);
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`music:open_controls:${guild.id}`)
+        .setLabel('Controls')
+        .setEmoji('🎛️')
+        .setStyle(ButtonStyle.Primary)
+    );
     await interaction.editReply({
       content: `🎧 Joined **${voice.name}** and ready to play! Summoned by <@${interaction.user.id}>.`,
-      embeds: panel.embeds,
-      components: panel.components
+      components: [row]
     });
     return;
   }
@@ -701,7 +716,6 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
       }
     }
 
-    const panel = makePanel(guild.id);
     let replyMsg = '';
     if (tracks.length > 1) {
       replyMsg = `🎶 Loaded playlist with **${addedCount}** tracks! Now playing **${firstTrack.title}**.`;
@@ -709,10 +723,27 @@ async function executeCommand(interaction: ChatInputCommandInteraction): Promise
       replyMsg = firstResult?.started ? `Now playing **${firstTrack.title}**.` : `Added **${firstTrack.title}** to the queue at position ${firstResult?.position}.`;
     }
 
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`music:open_controls:${guild.id}`)
+        .setLabel('Controls')
+        .setEmoji('🎛️')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`music:np_add_playlist:${guild.id}`)
+        .setLabel('Add to Playlist')
+        .setEmoji('➕')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`music:like:${guild.id}`)
+        .setLabel('Like')
+        .setEmoji('❤️')
+        .setStyle(ButtonStyle.Secondary)
+    );
+
     await interaction.editReply({
       content: replyMsg,
-      embeds: panel.embeds,
-      components: panel.components
+      components: [row]
     });
     return;
   }
@@ -817,6 +848,21 @@ async function executeButton(interaction: ButtonInteraction): Promise<void> {
         { name: 'Genres', value: current.genreTags?.join(', ') || 'None', inline: true }
       );
     return void await interaction.reply({ embeds: [embed], ephemeral: true });
+  }
+
+  if (action === 'np_add_playlist') {
+    if (!snapshot?.current) return void await interaction.reply({ content: '❌ Nothing is currently playing to add to a playlist.', ephemeral: true });
+    const modal = new ModalBuilder()
+      .setCustomId(`music_modal_np_playlist:${guildId}`)
+      .setTitle('Add Song to Playlist');
+    const input = new TextInputBuilder()
+      .setCustomId('playlist_name')
+      .setLabel('Playlist Name')
+      .setPlaceholder('e.g. My Favorites, Party, Chill')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+    return void await interaction.showModal(modal);
   }
 
   if (action === 'like') {
@@ -930,16 +976,15 @@ async function executeButton(interaction: ButtonInteraction): Promise<void> {
 
   if (action === 'prev') {
     replayTrack(guildId);
-    return void await interaction.update(makePanel(guildId));
+    return void await interaction.update({ content: '⏮️ Replaying track.', embeds: [], components: [] });
   }
   if (action === 'play_pause') {
-    if (snapshot?.paused) resumePlayback(guildId);
-    else pausePlayback(guildId);
-    return void await interaction.update(makePanel(guildId));
+    const isPausedNow = snapshot?.paused ? (resumePlayback(guildId), false) : (pausePlayback(guildId), true);
+    return void await interaction.update({ content: isPausedNow ? '⏸️ Playback paused.' : '▶️ Playback resumed.', embeds: [], components: [] });
   }
   if (action === 'skip') {
     skipPlayback(guildId);
-    return void await interaction.update(makePanel(guildId));
+    return void await interaction.update({ content: '⏭️ Skipped current track.', embeds: [], components: [] });
   }
   if (action === 'stop') {
     stopPlayback(guildId);
@@ -949,19 +994,19 @@ async function executeButton(interaction: ButtonInteraction): Promise<void> {
       prev.delete().catch(() => undefined);
       lastNowPlayingMessage.delete(guildId);
     }
-    return void await interaction.update(makePanel(guildId));
+    return void await interaction.update({ content: '⏹️ Stopped playback and cleared queue.', embeds: [], components: [] });
   }
   if (action === 'vol_down') {
-    adjustVolume(guildId, -10);
-    return void await interaction.update(makePanel(guildId));
+    const val = adjustVolume(guildId, -10);
+    return void await interaction.update({ content: `🔉 Volume lowered to **${val}%**.`, embeds: [], components: [] });
   }
   if (action === 'vol_up') {
-    adjustVolume(guildId, +10);
-    return void await interaction.update(makePanel(guildId));
+    const val = adjustVolume(guildId, +10);
+    return void await interaction.update({ content: `🔊 Volume increased to **${val}%**.`, embeds: [], components: [] });
   }
   if (action === 'repeat') {
-    cycleRepeatMode(guildId);
-    return void await interaction.update(makePanel(guildId));
+    const nextMode = cycleRepeatMode(guildId);
+    return void await interaction.update({ content: `🔁 Repeat mode set to **${nextMode}**.`, embeds: [], components: [] });
   }
   if (action === 'ai_mix') {
     await interaction.deferReply({ ephemeral: true });
@@ -972,11 +1017,10 @@ async function executeButton(interaction: ButtonInteraction): Promise<void> {
     for (const t of tracks) {
       await enqueueTrack(guild, voice, text, { ...t, requestedBy: interaction.user.id });
     }
-    const panel = makePanel(guildId);
     return void await interaction.editReply({
       content: `🪄 Added **${tracks.length}** AI mood-matched tracks (**${result.mood}**) to the queue!`,
-      embeds: panel.embeds,
-      components: panel.components
+      embeds: [],
+      components: []
     });
   }
 
@@ -1012,7 +1056,6 @@ async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<
       }
     }
 
-    const panel = makePanel(guildId);
     let replyMsg = '';
     if (tracks.length > 1) {
       replyMsg = `🎶 Loaded playlist with **${addedCount}** tracks! Now playing **${firstTrack.title}**.`;
@@ -1020,12 +1063,53 @@ async function executeModalSubmit(interaction: ModalSubmitInteraction): Promise<
       replyMsg = firstResult?.started ? `Now playing **${firstTrack.title}**.` : `Added **${firstTrack.title}** to the queue at position ${firstResult?.position}.`;
     }
 
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`music:open_controls:${guildId}`)
+        .setLabel('Controls')
+        .setEmoji('🎛️')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`music:np_add_playlist:${guildId}`)
+        .setLabel('Add to Playlist')
+        .setEmoji('➕')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`music:like:${guildId}`)
+        .setLabel('Like')
+        .setEmoji('❤️')
+        .setStyle(ButtonStyle.Secondary)
+    );
+
     await interaction.editReply({
       content: replyMsg,
-      embeds: panel.embeds,
-      components: panel.components
+      components: [row]
     });
     return;
+  }
+
+  if (prefix === 'music_modal_np_playlist') {
+    const playlistName = interaction.fields.getTextInputValue('playlist_name').trim();
+    if (!playlistName) throw new Error('Playlist name cannot be empty.');
+    const snapshot = getSnapshot(guildId);
+    if (!snapshot?.current) throw new Error('Nothing is currently playing to add.');
+
+    await interaction.deferReply({ ephemeral: true });
+    const playlists = await listPlaylists(guildId, interaction.user.id);
+    const existing = playlists.find(p => p.name.toLowerCase() === playlistName.toLowerCase());
+    if (!existing) {
+      await createPlaylist(guildId, interaction.user.id, playlistName);
+    }
+    await addPlaylistTrack(guildId, interaction.user.id, playlistName, {
+      title: snapshot.current.title,
+      url: snapshot.current.url,
+      artist: snapshot.current.artist,
+      requestedBy: interaction.user.id
+    });
+    const updatedTracks = await getPlaylistTracks(guildId, interaction.user.id, playlistName);
+    return void await interaction.editReply({
+      content: `✅ Added **${snapshot.current.title}** to playlist **${playlistName}**! (Total tracks: ${updatedTracks.length})\nUse \`/playlist play name:${playlistName}\` to play it in voice.`
+    });
   }
 
   if (prefix === 'music_modal_search') {
@@ -1089,9 +1173,16 @@ export function registerBotHandlers(client: Client): void {
       const channel = guild.systemChannel ?? guild.channels.cache.find(c => c.isTextBased() && 'send' in c);
       if (channel && 'send' in channel) {
         const greeting = inviterId ? `👋 Thanks for inviting me, <@${inviterId}>!` : `👋 Thanks for inviting me!`;
+        const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`music:open_controls:${guild.id}`)
+            .setLabel('Controls')
+            .setEmoji('🎛️')
+            .setStyle(ButtonStyle.Primary)
+        );
         await (channel as GuildTextBasedChannel).send({
           content: `${greeting} I'm your AI Music Companion.\nJoin a voice channel and type </join:0> or </play:0> to open your music controller.`,
-          ...makePanel(guild.id)
+          components: [row]
         }).catch(() => undefined);
       }
     } catch (err) {
